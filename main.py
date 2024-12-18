@@ -2,11 +2,10 @@
 import math
 import numpy as np
 import casadi as ca
-
+from visualize import create_visualization
+from debug_casadi import print_matrix, print_structured_matrix
+from typing import Dict, List, Tuple
 import time
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-import matplotlib.gridspec as gridspec
 
 
 NDIM      = 2         # 轨迹维数
@@ -26,13 +25,13 @@ VEL_SHIFT = 0.5
 # 可行性参数
 max_vel_sq = 2
 max_acc_sq = 3
-max_cur_sq = 5
+max_cur_sq = 0.5
 
 # 优化权重
-weight_dt = 0.1
-weight_vel = 0#10.0
-weight_acc = 0#10.0
-weight_cur = 0#10.0
+weight_dt = 10
+weight_vel = 100.0
+weight_acc = 100.0
+weight_cur = 100.0
 
 
 def constructBetaT(t, rank:int):
@@ -175,7 +174,7 @@ def constrainCostFunc(pieceT, coff_mat):
     # curvature_sq = ca.sum2((accs @ AUXB) * vels)**2 / vels_sqsum ** 3
     numerator = (vels[:,0]*accs[:,1] - vels[:,1]*accs[:,0])**2
     denominator = vels_sqsum**3
-    curvature_sq = numerator / denominator
+    curvature_sq = numerator / (denominator+0.001)
 
     con_vel = ca.sum1(L1slack(vels_sqsum - max_vel_sq))
     con_acc = ca.sum1(L1slack(accs_sqsum - max_acc_sq))
@@ -190,6 +189,7 @@ def constructStateByPosAndDir(pos, vel_theta, sign):
     ret[1, 1] = ca.sin(vel_theta) * VEL_SHIFT * sign
     return ret
 
+
 def objectFuncWithConstrain(mid_pos, vel_angles, traj_ts_free, start_state, end_state):
     ''' 代价函数 '''
     cost =  0
@@ -203,18 +203,19 @@ def objectFuncWithConstrain(mid_pos, vel_angles, traj_ts_free, start_state, end_
     #    0  1  2  3  4  5  6  7  8  9  10 11 12 13 14
     for i in range(NTRAJ):
         trajTs = Tfn(traj_ts_free[i])
+        # pieceT = ca.MX.sym('T')
         pieceT = trajTs / NPIECE
         traj_mid_pos = mid_pos[i*NPIECE:(i+1)*NPIECE-1, :]
 
         if i==0:
             state0 = start_state
         else:
-            state0 = constructStateByPosAndDir(mid_pos[i*NPIECE-1, :], vel_angles[i-1], -1)      # 速度与上一段相反
+            state0 = constructStateByPosAndDir(mid_pos[i*NPIECE-1, :], vel_angles[i-1,0], -1)      # 速度与上一段相反
 
         if i==NTRAJ-1:
             stateT = end_state
         else:
-            stateT = constructStateByPosAndDir(mid_pos[(i+1)*NPIECE-1, :], vel_angles[i], 1)
+            stateT = constructStateByPosAndDir(mid_pos[(i+1)*NPIECE-1, :], vel_angles[i,0], 1)
 
         M = constructM(pieceT=pieceT, num_pieces=NPIECE)
         bbint = constructBBTint(pieceT=pieceT, rank=S)      # (ncoff * ncoff)
@@ -223,70 +224,243 @@ def objectFuncWithConstrain(mid_pos, vel_angles, traj_ts_free, start_state, end_
 
 
         for j in range(NPIECE):
-            cj = c[j*NCOFF:(j+1)*NCOFF]
+            cj = c[j*NCOFF:(j+1)*NCOFF, :]
             cost += ca.trace(cj.T @ bbint @ cj)
-        cost += traj_ts_free[i] * weight_dt
+        cost += pieceT * weight_dt
 
         cost += constrainCostFunc(pieceT=pieceT, coff_mat=c)
     return cost
 
-# 1. 基本的打印辅助函数
-def print_matrix(matrix, name="Matrix"):
-    """更易读的矩阵打印函数"""
-    print(f"\n{name}:")
-    if isinstance(matrix, ca.MX):
-        rows, cols = matrix.shape
-        for i in range(rows):
-            row_str = "["
-            for j in range(cols):
-                elem = matrix[i,j]
-                # 尝试简化表达式
-                if elem.is_constant():
-                    row_str += f"{float(elem):8.3f}"
-                else:
-                    row_str += f"{str(elem):8s}"
-                row_str += " "
-            row_str += "]"
-            print(row_str)
 
-# 2. 带有详细信息的矩阵分析
-def analyze_matrix(matrix, name="Matrix"):
-    """详细分析矩阵结构"""
-    print(f"\n=== Analysis of {name} ===")
-    print(f"Shape: {matrix.shape}")
-    print(f"Number of elements: {matrix.numel()}")
-    print(f"Symbolic variables: {[str(v) for v in ca.symvar(matrix)]}")
+def test_obj_func():
+    mid_pos = ca.MX.sym('mid_pos', NTRAJ*NPIECE-1, NDIM)
+    vel_angles = ca.MX.sym('vel_angles', NTRAJ-1)
+    traj_ts_free = ca.MX.sym('traj_ts_free', NTRAJ)
+    start_state = ca.MX.sym('start_state', S, NDIM)
+    end_state = ca.MX.sym('end_state', S, NDIM)
 
-    # 打印每个元素的详细信息
-    rows, cols = matrix.shape
-    for i in range(rows):
-        for j in range(cols):
-            elem = matrix[i,j]
-            print(f"\nElement [{i},{j}]:")
-            print(f"  Expression: {str(elem)}")
-            print(f"  Is symbolic: {elem.is_symbolic()}")
-            print(f"  Is constant: {elem.is_constant()}")
+    objectFuncWithConstrain(
+        mid_pos=mid_pos,
+        vel_angles=vel_angles,
+        traj_ts_free=traj_ts_free,
+        start_state=start_state,
+        end_state=end_state)
 
-# 4. 结构化展示复杂矩阵
-def print_structured_matrix(matrix):
-    """结构化展示矩阵内容"""
-    rows, cols = matrix.shape
+def optimize_soft_constrain(start_state_np, end_state_np):
+    opti = ca.Opti()
 
-    # 获取元素的最大字符长度
-    max_length = 0
-    for i in range(rows):
-        for j in range(cols):
-            max_length = max(max_length, len(str(matrix[i,j])))
+    start_state = ca.DM(start_state_np)
+    end_state = ca.DM(end_state_np)
+    # traj_ts_free = ca.DM([2,2])
 
-    # 打印矩阵
-    print("\nMatrix structure:")
-    print("─" * (cols * (max_length + 3) + 1))
-    for i in range(rows):
-        print("│", end=" ")
-        for j in range(cols):
-            elem = str(matrix[i,j])
-            print(f"{elem:{max_length}}", end=" │ ")
-        print("\n" + "─" * (cols * (max_length + 3) + 1))
+    mid_pos = opti.variable(NMIDPT, NDIM)
+    vel_angles = opti.variable(NTRAJ-1, 1)
+    traj_ts_free = opti.variable(NTRAJ, 1)
+
+    opti.set_initial(mid_pos, np.array([[0,1],[1,3],[1,1]]))
+    opti.set_initial(vel_angles, np.array([ca.pi/2]))
+    opti.set_initial(traj_ts_free, np.array([0,0]))
+
+    opti.minimize(objectFuncWithConstrain(mid_pos=mid_pos, vel_angles=vel_angles, traj_ts_free=traj_ts_free, start_state=start_state, end_state=end_state))
+
+    # opti.solver('bonmin')
+    # SQP求解器配置
+    sqp_opts = {
+        'max_iter': 1000,
+        'print_iteration': True,
+        'print_header': True,
+        'print_status': True,
+        'tol_du': 1e-6,
+        'tol_pr': 1e-6,
+        'hessian_approximation': 'exact',  # 或者使用 'gauss-newton'
+        'qpsol': 'qpoases',  # QP子问题求解器
+        'qpsol_options': {
+            'printLevel': 'none'
+        }
+    }
+
+    # 设置求解器
+    # opti.solver('sqpmethod', sqp_opts)
+    opti.solver('ipopt')
+    opti.solver('bonmin')
+
+    sol = opti.solve()
+    print(sol.value(mid_pos))
+    print(sol.value(vel_angles))
+    print(sol.value(traj_ts_free))
+
+    eval_and_show(
+        mid_pos_np=sol.value(mid_pos),
+        vel_angles_np=sol.value(vel_angles),
+        traj_ts_free_np=sol.value(traj_ts_free),
+        start_state_np=start_state_np,
+        end_state_np=end_state_np
+    )
+
+
+def compare_solvers(start_state_np, end_state_np):
+    # 定义要测试的求解器列表
+    solvers = ['ipopt']  # 可以根据实际安装情况调整
+    results = {}
+
+    for solver_name in solvers:
+        try:
+            result = solve_with_solver(
+                start_state_np,
+                end_state_np,
+                solver_name
+            )
+            results[solver_name] = result
+        except Exception as e:
+            print(f"Solver {solver_name} failed: {str(e)}")
+            results[solver_name] = None
+
+    # 打印比较结果
+    print_comparison(results)
+
+    # 可视化最佳结果
+    best_solver = find_best_solver(results)
+    if best_solver:
+        print(f"\nBest solver: {best_solver}")
+        best_result = results[best_solver]
+        eval_and_show(
+            mid_pos_np=best_result['mid_pos'],
+            vel_angles_np=best_result['vel_angles'],
+            traj_ts_free_np=best_result['traj_ts_free'],
+            start_state_np=start_state_np,
+            end_state_np=end_state_np
+        )
+
+    return results
+
+def solve_with_solver(start_state_np, end_state_np, solver_name: str) -> Dict:
+    """使用指定求解器求解优化问题"""
+    opti = ca.Opti()
+
+    start_state = ca.DM(start_state_np)
+    end_state = ca.DM(end_state_np)
+
+    # 定义变量
+    mid_pos = opti.variable(NMIDPT, NDIM)
+    vel_angles = opti.variable(NTRAJ-1, 1)
+    traj_ts_free = opti.variable(NTRAJ, 1)
+
+    # 设置初值
+    opti.set_initial(mid_pos, np.array([[0,1],[1,3],[1,1],[1,3],[1,1]]))
+    opti.set_initial(vel_angles, np.array([ca.pi/2,ca.pi/2]))
+    opti.set_initial(traj_ts_free, np.array([0,0,0]))
+
+    # 设置目标函数
+    opti.minimize(objectFuncWithConstrain(
+        mid_pos=mid_pos,
+        vel_angles=vel_angles,
+        traj_ts_free=traj_ts_free,
+        start_state=start_state,
+        end_state=end_state
+    ))
+
+    # 配置求解器选项
+    solver_options = get_solver_options(solver_name)
+    opti.solver(solver_name, solver_options)
+
+    # 计时并求解
+    start_time = time.time()
+    try:
+        sol = opti.solve()
+        solve_time = time.time() - start_time
+
+        # 计算目标函数值
+        obj_value = sol.value(opti.f)
+
+        return {
+            'success': True,
+            'solve_time': solve_time,
+            'objective_value': obj_value,
+            'mid_pos': sol.value(mid_pos),
+            'vel_angles': sol.value(vel_angles),
+            'traj_ts_free': sol.value(traj_ts_free),
+            'solver_stats': opti.stats()
+        }
+    except Exception as e:
+        return {
+            'success': False,
+            'error': str(e),
+            'solve_time': time.time() - start_time
+        }
+
+def get_solver_options(solver_name: str) -> Dict:
+    """返回求解器特定的选项"""
+    common_options = {
+        'print_time': True,
+        'ipopt.print_level': 0,
+        'ipopt.sb': 'yes'
+    }
+
+    solver_specific_options = {
+        'bonmin': {
+            # 'bonmin.algorithm': 'B-BB',
+            # 'bonmin.solution_limit': 1
+        },
+        'ipopt': {
+            'ipopt.max_iter': 1000,
+            'ipopt.print_level': 0,  # 0-12
+            'print_time': True,
+            'ipopt.tol': 1e-6,      # 收敛容差
+            'ipopt.hessian_approximation': 'limited-memory',  # 使用L-BFGS
+
+        },
+        'knitro': {
+            'knitro.algorithm': 1,
+            'knitro.mir_maxiter': 1000
+        }
+    }
+
+    options = common_options.copy()
+    if solver_name in solver_specific_options:
+        options.update(solver_specific_options[solver_name])
+
+    return options
+
+def print_comparison(results: Dict):
+    """打印求解器比较结果"""
+    print("\nSolver Comparison Results:")
+    print("-" * 80)
+    print(f"{'Solver':<15} {'Status':<10} {'Time (s)':<12} {'Objective':<15} {'Iterations':<10}")
+    print("-" * 80)
+
+    for solver_name, result in results.items():
+        if result and result['success']:
+            status = "Success"
+            solve_time = f"{result['solve_time']:.4f}"
+            obj_value = f"{result['objective_value']:.4e}"
+            iterations = result['solver_stats']['iter_count'] if 'iter_count' in result['solver_stats'] else 'N/A'
+        else:
+            status = "Failed"
+            solve_time = "N/A"
+            obj_value = "N/A"
+            iterations = "N/A"
+
+        print(f"{solver_name:<15} {status:<10} {solve_time:<12} {obj_value:<15} {iterations:<10}")
+
+    print("-" * 80)
+
+def find_best_solver(results: Dict) -> str:
+    """根据目标函数值和求解时间找到最佳求解器"""
+    valid_results = {
+        name: result for name, result in results.items()
+        if result and result['success']
+    }
+
+    if not valid_results:
+        return None
+
+    # 这里可以根据需要调整选择标准
+    # 当前使用目标函数值作为主要标准
+    return min(
+        valid_results.items(),
+        key=lambda x: x[1]['objective_value']
+    )[0]
+
 
 def createEvalFunc():
     # mid_pos, vel_dirs, trajTs, start_state, end_state
@@ -301,6 +475,7 @@ def createEvalFunc():
     positions = ca.MX(NTRAJ*NPIECE*NDRAW_PT, NDIM)
     velocities = ca.MX(NTRAJ*NPIECE*NDRAW_PT, NDIM)
     accelerates = ca.MX(NTRAJ*NPIECE*NDRAW_PT, NDIM)
+    curvatures_sq = ca.MX(NTRAJ*NPIECE*NDRAW_PT, 1)
 
     for i in range(NTRAJ):
         trajTs = Tfn(traj_ts_free[i])
@@ -325,149 +500,29 @@ def createEvalFunc():
         vel_ckpt_mat = constructNPiecesCkptMat(pieceT=pieceT, rank=1, nckpt=NDRAW_PT, npiece=NPIECE)
         acc_ckpt_mat = constructNPiecesCkptMat(pieceT=pieceT, rank=2, nckpt=NDRAW_PT, npiece=NPIECE)
 
+        pos_ckpts = pos_ckpt_mat.T @ c
+        vel_ckpts = vel_ckpt_mat.T @ c
+        acc_ckpts = acc_ckpt_mat.T @ c
+
+        vels_sqsum = ca.sum2(vel_ckpts ** 2)
+        numerator = (vel_ckpts[:,0]*acc_ckpts[:,1] - vel_ckpts[:,1]*acc_ckpts[:,0])**2
+        denominator = vels_sqsum**3
+        curvature_sq_ckpts = numerator / (denominator+0.001)
+
         start_ind = i*NPIECE*NDRAW_PT
         end_ind = start_ind + NPIECE*NDRAW_PT
-        positions[start_ind:end_ind, :] = pos_ckpt_mat.T @ c
-        velocities[start_ind:end_ind, :] = vel_ckpt_mat.T @ c
-        accelerates[start_ind:end_ind, :] = acc_ckpt_mat.T @ c
+        positions[start_ind:end_ind, :] = pos_ckpts
+        velocities[start_ind:end_ind, :] = vel_ckpts
+        accelerates[start_ind:end_ind, :] = acc_ckpts
+        curvatures_sq[start_ind:end_ind, :] = curvature_sq_ckpts
 
     return ca.Function(
         'eval_traj',
         [mid_pos, vel_angles, traj_ts_free, start_state, end_state],
-        [positions, velocities, accelerates],
+        [positions, velocities, accelerates, curvatures_sq],
         ['mid_pos', 'vel_angles', 'traj_ts_free', 'start_state', 'end_state'],
-        ['positions', 'velocities', 'accelerates']
+        ['positions', 'velocities', 'accelerates', 'curvatures_sq']
         )
-
-
-def create_visualization(eval_result, total_time):
-    """
-    Create an animated visualization of the trajectory optimization.
-
-    Args:
-        eval_result: Dictionary containing 'positions', 'velocities', 'accelerates' from eval_traj
-        total_time: Total time duration for the trajectory
-    """
-    # Convert casadi DM objects to numpy arrays and reshape
-    pos = np.array(eval_result['positions'])
-    vel = np.array(eval_result['velocities'])
-    acc = np.array(eval_result['accelerates'])
-
-    # Reshape arrays from (n,2) to (2,n)
-    n_points = pos.shape[0]
-    pos = pos.reshape(n_points, 2).T
-    vel = vel.reshape(n_points, 2).T
-    acc = acc.reshape(n_points, 2).T
-
-    # Create time vector
-    time = np.linspace(0, total_time, n_points)
-
-    # Calculate derived quantities
-    speed_magnitude = np.sum(vel**2, axis=0)
-    accel_magnitude = np.sum(acc**2, axis=0)
-
-    # Calculate curvature
-    B = np.array([[0, -1], [1, 0]])
-    curvature = np.zeros(n_points)
-    for i in range(n_points):
-        v = vel[:, i]
-        a = acc[:, i]
-        v_sq_sum = np.sum(v**2)
-        if v_sq_sum > 1e-6:
-            curvature[i] = np.sum((B @ a) * v)**2 / (v_sq_sum**3 + 1e-6)
-
-    # Create figure and subplots
-    fig = plt.figure(figsize=(12, 8))
-    gs = gridspec.GridSpec(3, 2, figure=fig)
-
-    # Trajectory subplot
-    ax_traj = fig.add_subplot(gs[:, 0])
-    ax_traj.grid(True)
-    ax_traj.set_aspect('equal')
-    ax_traj.set_xlabel('X Position')
-    ax_traj.set_ylabel('Y Position')
-    ax_traj.set_title('Motion Trajectory')
-
-    # Set axis limits with some padding
-    x_min, x_max = pos[0].min(), pos[0].max()
-    y_min, y_max = pos[1].min(), pos[1].max()
-    padding = 0.2 * max(x_max - x_min, y_max - y_min)
-    ax_traj.set_xlim(x_min - padding, x_max + padding)
-    ax_traj.set_ylim(y_min - padding, y_max + padding)
-
-    # Plot full trajectory
-    ax_traj.plot(pos[0, :], pos[1, :], 'b-', alpha=0.3, label='Trajectory')
-
-    # Create moving objects
-    particle, = ax_traj.plot([], [], 'bo', markersize=10, label='Particle')
-    vel_arrow = ax_traj.quiver([], [], [], [], color='r', scale=20, label='Velocity')
-    acc_arrow = ax_traj.quiver([], [], [], [], color='g', scale=20, label='Acceleration')
-    ax_traj.legend()
-
-    # Speed subplot
-    ax_speed = fig.add_subplot(gs[0, 1])
-    ax_speed.grid(True)
-    ax_speed.set_ylabel('Speed Magnitude')
-    ax_speed.set_title('Speed vs Time')
-    ax_speed.plot(time, speed_magnitude, 'b-', alpha=0.3)
-    speed_point, = ax_speed.plot([], [], 'r.', markersize=10)
-    speed_line = ax_speed.axvline(x=time[0], color='k', linestyle='--')
-
-    # Acceleration subplot
-    ax_accel = fig.add_subplot(gs[1, 1])
-    ax_accel.grid(True)
-    ax_accel.set_ylabel('Acceleration Magnitude')
-    ax_accel.plot(time, accel_magnitude, 'b-', alpha=0.3)
-    accel_point, = ax_accel.plot([], [], 'g.', markersize=10)
-    accel_line = ax_accel.axvline(x=time[0], color='k', linestyle='--')
-
-    # Curvature subplot
-    ax_curv = fig.add_subplot(gs[2, 1])
-    ax_curv.grid(True)
-    ax_curv.set_xlabel('Time (s)')
-    ax_curv.set_ylabel('Curvature')
-    ax_curv.plot(time, curvature, 'b-', alpha=0.3)
-    curv_point, = ax_curv.plot([], [], 'g.', markersize=10)
-    curv_line = ax_curv.axvline(x=time[0], color='k', linestyle='--')
-
-    def init():
-        particle.set_data([], [])
-        speed_point.set_data([], [])
-        accel_point.set_data([], [])
-        curv_point.set_data([], [])
-        return particle, speed_point, accel_point, curv_point
-
-    def animate(i):
-        # Update particle position - 修正这里
-        particle.set_data([pos[0, i]], [pos[1, i]])  # 使用列表包装单个值
-
-        # Update velocity arrow
-        vel_arrow.set_offsets(np.column_stack((pos[0, i], pos[1, i])))
-        vel_arrow.set_UVC(vel[0, i], vel[1, i])
-
-        # Update acceleration arrow
-        acc_arrow.set_offsets(np.column_stack((pos[0, i], pos[1, i])))
-        acc_arrow.set_UVC(acc[0, i], acc[1, i])
-
-        # Update speed plot
-        speed_point.set_data(time[:i+1], speed_magnitude[:i+1])
-        speed_line.set_xdata([time[i], time[i]])
-
-        # Update acceleration plot
-        accel_point.set_data(time[:i+1], accel_magnitude[:i+1])
-        accel_line.set_xdata([time[i], time[i]])
-
-        # Update curvature plot
-        curv_point.set_data(time[:i+1], curvature[:i+1])
-        curv_line.set_xdata([time[i], time[i]])
-
-        return particle, vel_arrow, acc_arrow, speed_point, accel_point, curv_point
-
-    anim = FuncAnimation(fig, animate, init_func=init, frames=n_points,
-                        interval=50, blit=True, repeat=False)
-
-    plt.tight_layout()
-    plt.show()
 
 def eval_and_show(mid_pos_np, vel_angles_np, traj_ts_free_np, start_state_np, end_state_np):
     eval_traj = createEvalFunc()
@@ -491,7 +546,7 @@ def eval_and_show(mid_pos_np, vel_angles_np, traj_ts_free_np, start_state_np, en
     # print(eval_result)
     create_visualization(eval_result=eval_result, total_time=np.sum(Tfn(traj_ts_free_np)))
 
-def test_eval():
+def evaluate():
     mid_pos = [
         [0, 1],
         [1, 1],
@@ -517,157 +572,6 @@ def test_eval():
     eval_and_show(mid_pos, vel_angles, traj_ts_free, start_state, end_state)
 
 
-def test_opt_soft_constrain(start_state_np, end_state_np):
-    opti = ca.Opti()
-
-    start_state = ca.DM(start_state_np)
-    end_state = ca.DM(end_state_np)
-    # traj_ts_free = ca.DM([2,2])
-
-    mid_pos = opti.variable(NMIDPT, NDIM)
-    vel_angles = opti.variable(NTRAJ-1, 1)
-    traj_ts_free = opti.variable(NTRAJ, 1)
-
-    opti.set_initial(mid_pos, np.array([[0,1],[1,3],[1,1]]))
-    opti.set_initial(vel_angles, np.array([ca.pi/2]))
-    opti.set_initial(traj_ts_free, np.array([0,0]))
-
-    opti.minimize(objectFuncWithConstrain(mid_pos=mid_pos, vel_angles=vel_angles, traj_ts_free=traj_ts_free, start_state=start_state, end_state=end_state))
-
-    opti.solver('ipopt')
-
-
-    sol = opti.solve()
-    print(sol.value(mid_pos))
-    print(sol.value(vel_angles))
-    print(sol.value(traj_ts_free))
-
-    eval_and_show(
-        mid_pos_np=sol.value(mid_pos),
-        vel_angles_np=sol.value(vel_angles),
-        traj_ts_free_np=sol.value(traj_ts_free),
-        start_state_np=start_state_np,
-        end_state_np=end_state_np
-    )
-
-
-# def getConstraints(pieceT, coff_mat):
-#     """Returns inequality constraints for velocity, acceleration and curvature"""
-#     vel_ckm = constructNPiecesCkptMat(pieceT=pieceT, rank=1, nckpt=NCKPT, npiece=NPIECE)
-#     acc_ckm = constructNPiecesCkptMat(pieceT=pieceT, rank=2, nckpt=NCKPT, npiece=NPIECE)
-
-#     # 计算每个检查点的速度和加速度
-#     vels = vel_ckm.T @ coff_mat
-#     accs = acc_ckm.T @ coff_mat
-
-#     # 计算各个物理量
-#     vels_sqsum = ca.sum2(vels ** 2)
-#     accs_sqsum = ca.sum2(accs ** 2)
-
-#     # 计算曲率
-#     numerator = (vels[:,0]*accs[:,1] - vels[:,1]*accs[:,0])**2
-#     denominator = vels_sqsum**3 + 1e-3  # 添加小量避免除零
-
-#     # 对每个检查点返回约束
-#     return {
-#         'g_vel': vels_sqsum,      # <= max_vel_sq
-#         'g_acc': accs_sqsum,      # <= max_acc_sq
-#         'g_cur': numerator / denominator  # <= max_cur_sq
-#     }
-
-# def test_opt(start_state_np, end_state_np):
-#     opti = ca.Opti()
-
-#     start_state = ca.DM(start_state_np)
-#     end_state = ca.DM(end_state_np)
-#     traj_ts_free = opti.variable(NTRAJ, 1)  # 现在时间也作为优化变量
-
-#     mid_pos = opti.variable(NMIDPT, NDIM)
-#     vel_angles = opti.variable(NTRAJ-1, 1)
-
-#     # 设置初值
-#     # opti.set_initial(mid_pos, np.array([[0,1],[2,2],[2,2],[2,2],[3,1]]))
-#     # opti.set_initial(vel_angles, np.array([ca.pi/2]))
-#     # opti.set_initial(traj_ts_free, np.array([2, 2]))
-
-#     # 时间约束
-#     opti.subject_to(traj_ts_free >= -15)  # 每段最小时间
-#     opti.subject_to(traj_ts_free <= 15.0)  # 每段最大时间
-
-#     # 计算目标函数
-#     cost = 0
-#     Tfn = create_T_function()
-
-#     # 对每段轨迹添加约束
-#     for i in range(NTRAJ):
-#         trajTs = Tfn(traj_ts_free[i])
-#         pieceT = trajTs / NPIECE
-
-#         # 获取当前段的中间点
-#         traj_mid_pos = mid_pos[i*NPIECE:(i+1)*NPIECE-1, :]
-
-#         # 确定起点和终点状态
-#         if i==0:
-#             state0 = start_state
-#         else:
-#             state0 = constructStateByPosAndDir(mid_pos[i*NPIECE-1], vel_angles[i-1], -1)
-
-#         if i==NTRAJ-1:
-#             stateT = end_state
-#         else:
-#             stateT = constructStateByPosAndDir(mid_pos[(i+1)*NPIECE-1], vel_angles[i], 1)
-
-#         # 构造并求解轨迹系数
-#         M = constructM(pieceT=pieceT, num_pieces=NPIECE)
-#         bbint = constructBBTint(pieceT=pieceT, rank=S)
-#         B = constructB(state0=state0, stateT=stateT, mid_pos=traj_mid_pos, num_pieces=NPIECE)
-#         c = ca.solve(M, B)
-
-#         # 添加代价函数
-#         for j in range(NPIECE):
-#             cj = c[j*NCOFF:(j+1)*NCOFF]
-#             cost += ca.trace(cj.T @ bbint @ cj)
-#         cost += weight_dt * trajTs
-
-#         # 添加约束
-#         constraints = getConstraints(pieceT, c)
-#         opti.subject_to(constraints['g_vel'] <= max_vel_sq)
-#         opti.subject_to(constraints['g_acc'] <= max_acc_sq)
-#         opti.subject_to(constraints['g_cur'] <= max_cur_sq)
-
-#     # 设置目标函数
-#     opti.minimize(cost)
-
-#     # 求解器配置
-#     opts = {
-#         'ipopt.print_level': 3,
-#         'ipopt.tol': 1e-4,
-#         'ipopt.max_iter': 3000,
-#         'ipopt.warm_start_init_point': 'yes',
-#         'ipopt.mu_strategy': 'adaptive'
-#     }
-#     opti.solver('ipopt', opts)
-
-#     # try:
-#     sol = opti.solve()
-#     print("Optimization succeeded!")
-#     print("Mid positions:", sol.value(mid_pos))
-#     print("Velocity angles:", sol.value(vel_angles))
-#     print("Trajectory times:", sol.value(traj_ts_free))
-
-#     eval_and_show(
-#         mid_pos_np=sol.value(mid_pos),
-#         vel_angles_np=sol.value(vel_angles),
-#         traj_ts_free_np=sol.value(traj_ts_free),
-#         start_state_np=start_state_np,
-#         end_state_np=end_state_np
-#     )
-#     # except:
-#     #     print("Optimization failed!")
-#     #     print(opti.debug.value(mid_pos))
-#     #     print(opti.debug.value(vel_angles))
-#     #     print(opti.debug.value(traj_ts_free))
-
 def main():
     start_state = ca.DM([
         [0.0,0.0],
@@ -675,16 +579,17 @@ def main():
         [0.0,0.0]
     ])
     end_state = ca.DM([
-        [2.0,0.0],
-        [0.0,-0.25],
+        [1.0,3.0],
+        [0.0,0.25],
         [0.0,0.0]
     ])
 
     # test_eval()
-    test_opt_soft_constrain(start_state, end_state)
-    # test_opt(start_state, end_state)
+    # compare_solvers(start_state, end_state)
+    optimize_soft_constrain(start_state, end_state)
 
 if __name__ == '__main__':
     main()
+    # test_obj_func()
 
 
