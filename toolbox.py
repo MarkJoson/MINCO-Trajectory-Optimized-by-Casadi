@@ -7,7 +7,8 @@ from config import *
 __all__ = [
     'constructBetaT','constructEi','constructFi','constructF0',
     'constructEM','constructM','constructB','constructBBTint',
-    'create_L1_function','create_T_function','constructCkptMat','constructNPiecesCkptMat','create_softmax_function'
+    'L1_func','tau2T_func','constructCkptMat','constructNPiecesCkptMat','softmax_func',
+    'create_poly_eval_func', 'create_traj_eval_func'
 ]
 
 
@@ -88,9 +89,8 @@ def constructBBTint(pieceT, rank):
             bbint[i, j] = coff * beta[i] * beta[j] * pieceT
     return bbint
 
-def create_L1_function():
+def L1_func(x):
     a0 = 1e-1
-    x = ca.SX.sym('x')
 
     f1 = 0  # x <= 0
     f2 = -1/(2*a0**3)*x**4 + 1/a0**2*x**3  # 0 < x <= a0
@@ -99,25 +99,18 @@ def create_L1_function():
     L1 = ca.if_else(x <= 0, f1,
          ca.if_else(x <= a0, f2, f3))
 
-    L1_func = ca.Function('L1', [x], [L1])
+    return L1
 
-    return L1_func
+def tau2T_func(tau):
 
-def create_T_function():
-    tau = ca.SX.sym('tau')
+    # f1 = 0.5 * tau**2 + tau + 1  # tau > 0
+    # f2 = (tau**2 - 2*tau + 2)/2  # tau <= 0
+    # Tf = ca.if_else(tau > 0, f1, f2)
 
-    f1 = 0.5 * tau**2 + tau + 1  # tau > 0
-    f2 = (tau**2 - 2*tau + 2)/2  # tau <= 0
+    return tau**2+0.01
 
-    Tf = ca.if_else(tau > 0, f1, f2)
-
-    T_func = ca.Function('T', [tau], [tau**2+0.01])
-
-    return T_func
-
-def create_softmax_function():
-    x = ca.SX.sym('x')
-    return ca.Function('sigmoid', [x], [1 / (1 + ca.exp(-x))])
+def softmax_func(x):
+    return 1 / (1 + ca.exp(-x))
 
 
 def constructCkptMat(pieceT, num_ckpt:int, rank:int):
@@ -136,4 +129,41 @@ def constructNPiecesCkptMat(pieceT, rank:int, nckpt:int, npiece:int):
     for i in range(npiece):
         ckpt_mat[i*NCOFF:(i+1)*NCOFF, i*nckpt:(i+1)*nckpt] = constructCkptMat(pieceT=pieceT, num_ckpt=nckpt, rank=rank)
     return ckpt_mat
-    # return ca.repmat(constructCkptMat(pieceT=pieceT, num_ckpt=nckpt, rank=rank), npiece, 1)
+
+
+def create_poly_eval_func(n_piece, n_drawpt):
+    '''多项式评估函数，输入多项式系数，输出采样点'''
+    T = SYM_TYPE.sym('T') # type: ignore
+    coff = SYM_TYPE.sym('coff', n_piece, NDIM) # type: ignore
+
+    pos_ckpt_mat = constructNPiecesCkptMat(pieceT=T, rank=0, nckpt=n_drawpt, npiece=n_piece)
+    vel_ckpt_mat = constructNPiecesCkptMat(pieceT=T, rank=1, nckpt=n_drawpt, npiece=n_piece)
+    acc_ckpt_mat = constructNPiecesCkptMat(pieceT=T, rank=2, nckpt=n_drawpt, npiece=n_piece)
+
+    pos_ckpts = pos_ckpt_mat.T @ coff
+    vel_ckpts = vel_ckpt_mat.T @ coff
+    acc_ckpts = acc_ckpt_mat.T @ coff
+
+    vels_sqsum = ca.sum2(vel_ckpts ** 2)
+
+    numerator = (vel_ckpts[:,0]*acc_ckpts[:,1] - vel_ckpts[:,1]*acc_ckpts[:,0])**2
+    denominator = vels_sqsum**3
+    curvature_sq_ckpts = numerator / (denominator)
+
+    return ca.Function('poly_eval', [T, coff], [pos_ckpts, vel_ckpts, acc_ckpts, curvature_sq_ckpts])
+
+
+def create_traj_eval_func(n_piece, n_drawpt, n_mid_pos):
+    ''' 轨迹（多条piece）评估函数，输入起始点和中止点，输出采样点'''
+    T = SYM_TYPE.sym('T') # type: ignore
+    state0 = SYM_TYPE.sym('state0', S, NDIM)                # 起始坐标，行向量 # type: ignore
+    stateT = SYM_TYPE.sym('stateT', S, NDIM)                # 结束坐标，行向量 # type: ignore
+    mid_pos = SYM_TYPE.sym('mid_pos', n_mid_pos, NDIM)      # 中间坐标，行向量 # type: ignore
+
+    poly_eval_fn = create_poly_eval_func(n_piece=n_piece, n_drawpt=n_drawpt)
+
+    M = constructM(pieceT=T, num_pieces=n_piece)
+    B = constructB(state0=state0, stateT=stateT, mid_pos=mid_pos, num_pieces=n_piece)
+    c = ca.solve(M, B)
+
+    return ca.Function('mmp_eval', [T, state0, stateT, mid_pos], [poly_eval_fn(T, c)])
