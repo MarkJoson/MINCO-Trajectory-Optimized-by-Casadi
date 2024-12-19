@@ -1,199 +1,50 @@
 # pylint: disable=C0103,C0111,C0301
-import math
+import time
+from typing import Dict, List, Tuple
+
 import numpy as np
 import casadi as ca
 from visualize import create_visualization
 from debug_casadi import print_matrix, print_structured_matrix
-from typing import Dict, List, Tuple
-import time
 
+from config import *
+from toolbox import *
 
-NDIM      = 2         # 轨迹维数
+# 轨迹优化参数
 NTRAJ     = 2         # 轨迹条数
 NPIECE    = 2         # 5阶段轨迹曲线
 NMIDPT    = NTRAJ*NPIECE-1      # 中间路径点（优化变量）个数
-
-S         = 3         # jerk控制
-POLY_RANK = 2*S-1     # 多项式次数
-NCOFF     = 2*S       # 轨迹系数个数
-NCKPT     = 10        # 检查点个数
+NCKPT     = 20        # 检查点个数
 NDRAW_PT  = 50
 
 # 车辆换档时的速度
-VEL_SHIFT = 0.5
+VEL_SHIFT = 0.025
 
 # 可行性参数
 max_vel_sq = 2
 max_acc_sq = 3
-max_cur_sq = 0.5
+max_cur_sq = 1.5
 
 # 优化权重
-weight_dt = 10
-weight_vel = 100.0
-weight_acc = 100.0
-weight_cur = 100.0
-
-
-def constructBetaT(t, rank:int):
-    ''' 构造特定时间的β(t) '''
-    beta = ca.MX(NCOFF, 1)
-    for i in range(rank, NCOFF):
-        if not isinstance(t, int|float) or t!=0 or i-rank==0:
-            beta[i] = math.factorial(i)/math.factorial(i-rank) * t**(i-rank)
-    return beta
-
-def constructEi(T):
-    ''' 构造M矩阵中的Ei(2s*2s)=[β(T), β(T), ..., β(T)^(2s-2)] '''
-    Ei = ca.MX(NCOFF, NCOFF)
-    Ei[0, :] = constructBetaT(T, 0)
-    for i in range(1, NCOFF):
-        Ei[i, :] = constructBetaT(T, i-1)
-    return Ei
-
-def constructFi():
-    ''' 构造M矩阵中的Fi(2s*2s)=[0, -β(0), ..., β(0)^(2s-2)] '''
-    Fi = ca.MX(NCOFF, NCOFF)
-    for i in range(1, NCOFF):
-        Fi[i, :] = -constructBetaT(0, i-1)
-    return Fi
-
-def constructF0():
-    ''' 构造M矩阵中的F0(s*2s)=[β(0), ..., β(0)^(s-1)] '''
-    F0 = ca.MX(S, NCOFF)      # 端点约束
-    for i in range(S):
-        F0[i, :] = constructBetaT(0, i)
-    return F0
-
-def constructEM(T):
-    ''' 构造M矩阵中的E0(s*2s)=[β(T), ..., β(T)^(s-1)] '''
-    E0 = ca.MX(S, NCOFF)      # 端点约束
-    for i in range(S):
-        E0[i, :] = constructBetaT(T, i)
-    return E0
-
-def constructM(pieceT, num_pieces):
-    ''' 构造矩阵M=[
-        [F0,    0,      0,      0,    ...,    ],
-        [E1,   F1,      0,      0,    ...,    ],
-        [ 0,   E2,     F2,      0,    ...,    ],
-        ...
-    ]
-    '''
-    M = ca.MX(num_pieces*NCOFF, num_pieces*NCOFF)
-    # F0 = ca.MX.sym('F0', 3, 6)
-    # EM = ca.MX.sym('EM', 3, 6)
-    M[0:S, 0:NCOFF] = constructF0()         # 3*6
-    M[-S:, -NCOFF:] = constructEM(T=pieceT) # 3*6
-    for i in range(1, num_pieces):
-        # Fi = ca.MX.sym(f'F{i}', 6, 6)
-        # Ei = ca.MX.sym(f'E{i}', 6, 6)
-        M[(i-1)*NCOFF+S:i*NCOFF+S, (i-1)*NCOFF:i*NCOFF] = constructEi(pieceT)
-        M[(i-1)*NCOFF+S:i*NCOFF+S, i*NCOFF:(i+1)*NCOFF] = constructFi()
-    return M
-
-def constructB(state0, stateT, mid_pos, num_pieces):
-    ''' 构造右端路径点约束B矩阵'''
-    B = ca.MX(num_pieces*NCOFF, NDIM)
-    B[0:S,:] = state0                     # 起点状态
-    B[-S:,:] = stateT                       # 终点状态
-    for i in range(1, num_pieces):
-        B[(i-1)*NCOFF+S, :] = mid_pos[i-1, :]      # 设置中间路径点
-    return B
-
-def constructBBTint(pieceT, rank):
-    ''' c^T*(∫β*β^T*dt)*c ==> (2, NCOFF) * (NCOFF, NCOFF) * (NCOFF, 2) '''
-    bbint = ca.MX(NCOFF, NCOFF)
-    beta = constructBetaT(pieceT, rank)
-    for i in range(NCOFF):
-        for j in range(NCOFF):
-            if i+j-2*rank < 0: continue
-            coff = 1 / (i+j-2*rank+1)
-            bbint[i, j] = coff * beta[i] * beta[j] * pieceT
-    return bbint
-
-def create_L1_function():
-    a0 = 1e-3
-    x = ca.MX.sym('x')
-
-    f1 = 0  # x <= 0
-    f2 = -1/(2*a0**3)*x**4 + 1/a0**2*x**3  # 0 < x <= a0
-    f3 = x - a0/2  # a0 < x
-
-    L1 = ca.if_else(x <= 0, f1,
-         ca.if_else(x <= a0, f2, f3))
-
-    L1_func = ca.Function('L1', [x], [L1])
-
-    return L1_func
-
-def create_T_function():
-    tau = ca.MX.sym('tau')
-
-    f1 = 0.5 * tau**2 + tau + 1  # tau > 0
-    f2 = (tau**2 - 2*tau + 2)/2  # tau <= 0
-
-    Tf = ca.if_else(tau > 0, f1, f2)
-
-    T_func = ca.Function('T', [tau], [Tf])
-
-    return T_func
-
-def constructCkptMat(pieceT, num_ckpt:int, rank:int):
-    ''' 构造单个piece的CKPT检查矩阵 '''
-    ckpt_mat = ca.MX(NCOFF, num_ckpt)
-    ckpt_frac = [(i+1)/(num_ckpt+1) for i in range(num_ckpt)]
-    ckpt_ts = ckpt_frac * pieceT
-
-    for i in range(num_ckpt):
-        ckpt_mat[:, i] = constructBetaT(t=ckpt_ts[i], rank=rank)
-    return ckpt_mat
-
-def constructNPiecesCkptMat(pieceT, rank:int, nckpt:int, npiece:int):
-    ''' 构造整条轨迹的ckpt检查矩阵[NPIECE*NCOFF, NPIECE*NCKPT] '''
-    ckpt_mat = ca.MX(npiece*NCOFF, npiece*nckpt)
-    for i in range(npiece):
-        ckpt_mat[i*NCOFF:(i+1)*NCOFF, i*nckpt:(i+1)*nckpt] = constructCkptMat(pieceT=pieceT, num_ckpt=nckpt, rank=rank)
-    return ckpt_mat
-    # return ca.repmat(constructCkptMat(pieceT=pieceT, num_ckpt=nckpt, rank=rank), npiece, 1)
-
-def constrainCostFunc(pieceT, coff_mat):
-
-    L1slack = create_L1_function()
-
-    vel_ckm = constructNPiecesCkptMat(pieceT=pieceT, rank=1, nckpt=NCKPT, npiece=NPIECE)
-    acc_ckm = constructNPiecesCkptMat(pieceT=pieceT, rank=2, nckpt=NCKPT, npiece=NPIECE)
-
-    # [NPIECE*NCOFF, NCKPT].T @ [NPIECE*NCOFF, NDIM] -> [NUM_CKPT, NDIM]
-    vels = vel_ckm.T @ coff_mat
-    accs = acc_ckm.T @ coff_mat
-
-    vels_sqsum = ca.sum2(vels ** 2)
-    accs_sqsum = ca.sum2(accs ** 2)
-
-    # AUXB = ca.DM([[0,-1],[1,0]])
-    # curvature_sq = ca.sum2((accs @ AUXB) * vels)**2 / vels_sqsum ** 3
-    numerator = (vels[:,0]*accs[:,1] - vels[:,1]*accs[:,0])**2
-    denominator = vels_sqsum**3
-    curvature_sq = numerator / (denominator+0.001)
-
-    con_vel = ca.sum1(L1slack(vels_sqsum - max_vel_sq))
-    con_acc = ca.sum1(L1slack(accs_sqsum - max_acc_sq))
-    con_cur = ca.sum1(L1slack(curvature_sq - max_cur_sq))
-
-    return weight_vel*con_vel + weight_acc*con_acc + weight_cur*con_cur
+weight_dt = 0.1
+weight_vel = 1000.0
+weight_acc = 1000.0
+weight_cur = 1000.0
 
 def constructStateByPosAndDir(pos, vel_theta, sign):
-    ret = ca.MX(S, NDIM)
+    ret = SYM_TYPE(S, NDIM)
     ret[0, :] = pos
     ret[1, 0] = ca.cos(vel_theta) * VEL_SHIFT * sign
     ret[1, 1] = ca.sin(vel_theta) * VEL_SHIFT * sign
     return ret
 
-
 def objectFuncWithConstrain(mid_pos, vel_angles, traj_ts_free, start_state, end_state):
     ''' 代价函数 '''
     cost =  0
+    # Tfn = create_softmax_function()
     Tfn = create_T_function()
+    L1slack = create_L1_function()
+    # L1slack = create_softmax_function()
     # 中间点的个数为: NTraj * NPiece - 1
     # 其中i*NPiece是轨迹i和轨迹i+1的交界
     # [i*NPiece, (i+1)*NPiece-1) 一共Npiece-1个点是中间点
@@ -203,7 +54,7 @@ def objectFuncWithConstrain(mid_pos, vel_angles, traj_ts_free, start_state, end_
     #    0  1  2  3  4  5  6  7  8  9  10 11 12 13 14
     for i in range(NTRAJ):
         trajTs = Tfn(traj_ts_free[i])
-        # pieceT = ca.MX.sym('T')
+        # pieceT = SYM_TYPE.sym('T')
         pieceT = trajTs / NPIECE
         traj_mid_pos = mid_pos[i*NPIECE:(i+1)*NPIECE-1, :]
 
@@ -222,22 +73,45 @@ def objectFuncWithConstrain(mid_pos, vel_angles, traj_ts_free, start_state, end_
         B = constructB(state0=state0, stateT=stateT, mid_pos=traj_mid_pos, num_pieces=NPIECE)
         c = ca.solve(M, B)
 
+        # c = SYM_TYPE.sym('c',12,2)
 
+        # Minimal Control Effort
         for j in range(NPIECE):
             cj = c[j*NCOFF:(j+1)*NCOFF, :]
             cost += ca.trace(cj.T @ bbint @ cj)
-        cost += pieceT * weight_dt
 
-        cost += constrainCostFunc(pieceT=pieceT, coff_mat=c)
+        # Soft-Constrain
+        vel_ckm = constructNPiecesCkptMat(pieceT=pieceT, rank=1, nckpt=NCKPT, npiece=NPIECE)
+        acc_ckm = constructNPiecesCkptMat(pieceT=pieceT, rank=2, nckpt=NCKPT, npiece=NPIECE)
+
+        # [NPIECE*NCOFF, NCKPT].T @ [NPIECE*NCOFF, NDIM] -> [NUM_CKPT, NDIM]
+        vels = vel_ckm.T @ c
+        accs = acc_ckm.T @ c
+
+        # vels = SYM_TYPE.sym('vels',4,2)
+        # accs = SYM_TYPE.sym('accs',4,2)
+
+        vels_sqsum = ca.sum2(vels ** 2)
+        accs_sqsum = ca.sum2(accs ** 2)
+
+        numerator = (vels[:,0]*accs[:,1] - vels[:,1]*accs[:,0])**2
+        denominator = vels_sqsum**3
+        curvature_sq = numerator / (denominator)#+1e-5)
+
+        con_vel = ca.sum1(L1slack(vels_sqsum - max_vel_sq))
+        con_acc = ca.sum1(L1slack(accs_sqsum - max_acc_sq))
+        con_cur = ca.sum1(L1slack(curvature_sq - max_cur_sq))
+
+        cost += pieceT * weight_dt + weight_vel*con_vel + weight_acc*con_acc + weight_cur*con_cur
     return cost
 
-
 def test_obj_func():
-    mid_pos = ca.MX.sym('mid_pos', NTRAJ*NPIECE-1, NDIM)
-    vel_angles = ca.MX.sym('vel_angles', NTRAJ-1)
-    traj_ts_free = ca.MX.sym('traj_ts_free', NTRAJ)
-    start_state = ca.MX.sym('start_state', S, NDIM)
-    end_state = ca.MX.sym('end_state', S, NDIM)
+    ''' 使用代数变量带入参数方便检查错误 '''
+    mid_pos = SYM_TYPE.sym('mid_pos', NTRAJ*NPIECE-1, NDIM)
+    vel_angles = SYM_TYPE.sym('vel_angles', NTRAJ-1)
+    traj_ts_free = SYM_TYPE.sym('traj_ts_free', NTRAJ)
+    start_state = SYM_TYPE.sym('start_state', S, NDIM)
+    end_state = SYM_TYPE.sym('end_state', S, NDIM)
 
     objectFuncWithConstrain(
         mid_pos=mid_pos,
@@ -246,94 +120,55 @@ def test_obj_func():
         start_state=start_state,
         end_state=end_state)
 
-def optimize_soft_constrain(start_state_np, end_state_np):
-    opti = ca.Opti()
+## ^-------------------------------求解----------------------------------####
 
-    start_state = ca.DM(start_state_np)
-    end_state = ca.DM(end_state_np)
-    # traj_ts_free = ca.DM([2,2])
+def get_solver_options(solver_name: str) -> Dict:
+    """返回求解器特定的选项"""
+    common_options = {
+        'print_time': True,
+        # 'ipopt.print_level': 0,
+        # 'ipopt.sb': 'yes'
+    }
 
-    mid_pos = opti.variable(NMIDPT, NDIM)
-    vel_angles = opti.variable(NTRAJ-1, 1)
-    traj_ts_free = opti.variable(NTRAJ, 1)
-
-    opti.set_initial(mid_pos, np.array([[0,1],[1,3],[1,1]]))
-    opti.set_initial(vel_angles, np.array([ca.pi/2]))
-    opti.set_initial(traj_ts_free, np.array([0,0]))
-
-    opti.minimize(objectFuncWithConstrain(mid_pos=mid_pos, vel_angles=vel_angles, traj_ts_free=traj_ts_free, start_state=start_state, end_state=end_state))
-
-    # opti.solver('bonmin')
-    # SQP求解器配置
-    sqp_opts = {
-        'max_iter': 1000,
-        'print_iteration': True,
-        'print_header': True,
-        'print_status': True,
-        'tol_du': 1e-6,
-        'tol_pr': 1e-6,
-        'hessian_approximation': 'exact',  # 或者使用 'gauss-newton'
-        'qpsol': 'qpoases',  # QP子问题求解器
-        'qpsol_options': {
-            'printLevel': 'none'
+    solver_specific_options = {
+        'bonmin': {
+            # 'bonmin.algorithm': 'B-BB',
+            # 'bonmin.solution_limit': 1
+        },
+        'ipopt': {
+            'ipopt.max_iter': 1000,
+            'ipopt.print_level': 0,  # 0-12
+            'print_time': True,
+            'ipopt.tol': 1e-2,      # 收敛容差
+            'ipopt.acceptable_tol': 1e-2,
+        },
+        'knitro': {
+            'knitro.algorithm': 1,
+            'knitro.mir_maxiter': 1000
+        },
+        'sqpmethod': {
+            'max_iter': 1000,
+            'print_iteration': True,
+            'print_header': True,
+            'print_status': True,
+            'tol_du': 1e-6,
+            'tol_pr': 1e-6,
+            'hessian_approximation': 'exact',  # 或者使用 'gauss-newton'
+            'qpsol': 'qpoases',  # QP子问题求解器
+            'qpsol_options': {
+                'printLevel': 'none'
+            }
         }
     }
 
-    # 设置求解器
-    # opti.solver('sqpmethod', sqp_opts)
-    opti.solver('ipopt')
-    opti.solver('bonmin')
+    options = common_options.copy()
+    if solver_name in solver_specific_options:
+        options.update(solver_specific_options[solver_name])
 
-    sol = opti.solve()
-    print(sol.value(mid_pos))
-    print(sol.value(vel_angles))
-    print(sol.value(traj_ts_free))
-
-    eval_and_show(
-        mid_pos_np=sol.value(mid_pos),
-        vel_angles_np=sol.value(vel_angles),
-        traj_ts_free_np=sol.value(traj_ts_free),
-        start_state_np=start_state_np,
-        end_state_np=end_state_np
-    )
+    return options
 
 
-def compare_solvers(start_state_np, end_state_np):
-    # 定义要测试的求解器列表
-    solvers = ['ipopt']  # 可以根据实际安装情况调整
-    results = {}
-
-    for solver_name in solvers:
-        try:
-            result = solve_with_solver(
-                start_state_np,
-                end_state_np,
-                solver_name
-            )
-            results[solver_name] = result
-        except Exception as e:
-            print(f"Solver {solver_name} failed: {str(e)}")
-            results[solver_name] = None
-
-    # 打印比较结果
-    print_comparison(results)
-
-    # 可视化最佳结果
-    best_solver = find_best_solver(results)
-    if best_solver:
-        print(f"\nBest solver: {best_solver}")
-        best_result = results[best_solver]
-        eval_and_show(
-            mid_pos_np=best_result['mid_pos'],
-            vel_angles_np=best_result['vel_angles'],
-            traj_ts_free_np=best_result['traj_ts_free'],
-            start_state_np=start_state_np,
-            end_state_np=end_state_np
-        )
-
-    return results
-
-def solve_with_solver(start_state_np, end_state_np, solver_name: str) -> Dict:
+def solve_softobj_with_solver(start_state_np, end_state_np, solver_name: str) -> Dict:
     """使用指定求解器求解优化问题"""
     opti = ca.Opti()
 
@@ -346,9 +181,15 @@ def solve_with_solver(start_state_np, end_state_np, solver_name: str) -> Dict:
     traj_ts_free = opti.variable(NTRAJ, 1)
 
     # 设置初值
-    opti.set_initial(mid_pos, np.array([[0,1],[1,3],[1,1],[1,3],[1,1]]))
-    opti.set_initial(vel_angles, np.array([ca.pi/2,ca.pi/2]))
-    opti.set_initial(traj_ts_free, np.array([0,0,0]))
+
+    # opti.set_initial(mid_pos, np.array([[-0.00264075,  0.11095673],
+    #    [-0.01577599,  0.17299636],
+    #    [ 0.5       ,  0.05792456],
+    #    [ 1.01577598,  0.17299636],
+    #    [ 1.00264075,  0.11095673]]))
+    opti.set_initial(mid_pos, np.array([end_state_np[0,:]*(i+1)/(NMIDPT+1)+start_state_np[0,:]*(1-(i+1)/(NMIDPT+1)) for i in range(NMIDPT)]))
+    opti.set_initial(vel_angles, np.array([ca.pi]))
+    opti.set_initial(traj_ts_free, np.array([0.1]))
 
     # 设置目标函数
     opti.minimize(objectFuncWithConstrain(
@@ -361,7 +202,7 @@ def solve_with_solver(start_state_np, end_state_np, solver_name: str) -> Dict:
 
     # 配置求解器选项
     solver_options = get_solver_options(solver_name)
-    opti.solver(solver_name, solver_options)
+    opti.solver(solver_name)#, solver_options)
 
     # 计时并求解
     start_time = time.time()
@@ -388,38 +229,6 @@ def solve_with_solver(start_state_np, end_state_np, solver_name: str) -> Dict:
             'solve_time': time.time() - start_time
         }
 
-def get_solver_options(solver_name: str) -> Dict:
-    """返回求解器特定的选项"""
-    common_options = {
-        'print_time': True,
-        'ipopt.print_level': 0,
-        'ipopt.sb': 'yes'
-    }
-
-    solver_specific_options = {
-        'bonmin': {
-            # 'bonmin.algorithm': 'B-BB',
-            # 'bonmin.solution_limit': 1
-        },
-        'ipopt': {
-            'ipopt.max_iter': 1000,
-            'ipopt.print_level': 0,  # 0-12
-            'print_time': True,
-            'ipopt.tol': 1e-6,      # 收敛容差
-            'ipopt.hessian_approximation': 'limited-memory',  # 使用L-BFGS
-
-        },
-        'knitro': {
-            'knitro.algorithm': 1,
-            'knitro.mir_maxiter': 1000
-        }
-    }
-
-    options = common_options.copy()
-    if solver_name in solver_specific_options:
-        options.update(solver_specific_options[solver_name])
-
-    return options
 
 def print_comparison(results: Dict):
     """打印求解器比较结果"""
@@ -444,8 +253,27 @@ def print_comparison(results: Dict):
 
     print("-" * 80)
 
-def find_best_solver(results: Dict) -> str:
-    """根据目标函数值和求解时间找到最佳求解器"""
+def compare_solvers(start_state_np, end_state_np):
+    # 定义要测试的求解器列表
+    solvers = ['ipopt']  # 可以根据实际安装情况调整
+    results = {}
+
+    for solver_name in solvers:
+        try:
+            result = solve_softobj_with_solver(
+                start_state_np,
+                end_state_np,
+                solver_name
+            )
+            results[solver_name] = result
+        except Exception as e:
+            print(f"Solver {solver_name} failed: {str(e)}")
+            results[solver_name] = None
+
+    # 打印比较结果
+    print_comparison(results)
+
+    ##### 根据目标函数值和求解时间找到最佳求解器 #####
     valid_results = {
         name: result for name, result in results.items()
         if result and result['success']
@@ -454,28 +282,39 @@ def find_best_solver(results: Dict) -> str:
     if not valid_results:
         return None
 
-    # 这里可以根据需要调整选择标准
-    # 当前使用目标函数值作为主要标准
-    return min(
+    best_solver = min(
         valid_results.items(),
-        key=lambda x: x[1]['objective_value']
+        key=lambda x: x[1]['objective_value']       # 当前使用目标函数值作为主要标准
     )[0]
+
+    if best_solver:
+        print(f"\nBest solver: {best_solver}")
+        best_result = results[best_solver]
+        eval_and_show(
+            mid_pos_np=best_result['mid_pos'],
+            vel_angles_np=best_result['vel_angles'],
+            traj_ts_free_np=best_result['traj_ts_free'],
+            start_state_np=start_state_np,
+            end_state_np=end_state_np
+        )
+
+    return results
 
 
 def createEvalFunc():
     # mid_pos, vel_dirs, trajTs, start_state, end_state
     Tfn = create_T_function()
 
-    mid_pos = ca.MX.sym('mid_pos', NTRAJ*NPIECE-1, NDIM)
-    vel_angles = ca.MX.sym('vel_angles', NTRAJ-1)
-    traj_ts_free = ca.MX.sym('traj_ts_free', NTRAJ)
-    start_state = ca.MX.sym('start_state', S, NDIM)
-    end_state = ca.MX.sym('end_state', S, NDIM)
+    mid_pos = SYM_TYPE.sym('mid_pos', NTRAJ*NPIECE-1, NDIM)
+    vel_angles = SYM_TYPE.sym('vel_angles', NTRAJ-1)
+    traj_ts_free = SYM_TYPE.sym('traj_ts_free', NTRAJ)
+    start_state = SYM_TYPE.sym('start_state', S, NDIM)
+    end_state = SYM_TYPE.sym('end_state', S, NDIM)
 
-    positions = ca.MX(NTRAJ*NPIECE*NDRAW_PT, NDIM)
-    velocities = ca.MX(NTRAJ*NPIECE*NDRAW_PT, NDIM)
-    accelerates = ca.MX(NTRAJ*NPIECE*NDRAW_PT, NDIM)
-    curvatures_sq = ca.MX(NTRAJ*NPIECE*NDRAW_PT, 1)
+    positions = SYM_TYPE(NTRAJ*NPIECE*NDRAW_PT, NDIM)
+    velocities = SYM_TYPE(NTRAJ*NPIECE*NDRAW_PT, NDIM)
+    accelerates = SYM_TYPE(NTRAJ*NPIECE*NDRAW_PT, NDIM)
+    curvatures_sq = SYM_TYPE(NTRAJ*NPIECE*NDRAW_PT, 1)
 
     for i in range(NTRAJ):
         trajTs = Tfn(traj_ts_free[i])
@@ -507,7 +346,7 @@ def createEvalFunc():
         vels_sqsum = ca.sum2(vel_ckpts ** 2)
         numerator = (vel_ckpts[:,0]*acc_ckpts[:,1] - vel_ckpts[:,1]*acc_ckpts[:,0])**2
         denominator = vels_sqsum**3
-        curvature_sq_ckpts = numerator / (denominator+0.001)
+        curvature_sq_ckpts = numerator / (denominator)
 
         start_ind = i*NPIECE*NDRAW_PT
         end_ind = start_ind + NPIECE*NDRAW_PT
@@ -543,7 +382,6 @@ def eval_and_show(mid_pos_np, vel_angles_np, traj_ts_free_np, start_state_np, en
         }
     )
 
-    # print(eval_result)
     create_visualization(eval_result=eval_result, total_time=np.sum(Tfn(traj_ts_free_np)))
 
 def evaluate():
@@ -573,20 +411,203 @@ def evaluate():
 
 
 def main():
-    start_state = ca.DM([
+    start_state = np.array([
         [0.0,0.0],
         [0.0,0.25],
         [0.0,0.0]
     ])
-    end_state = ca.DM([
-        [1.0,3.0],
+    end_state = np.array([
+        [1.0,0.0],
         [0.0,0.25],
         [0.0,0.0]
     ])
 
-    # test_eval()
-    # compare_solvers(start_state, end_state)
-    optimize_soft_constrain(start_state, end_state)
+    result = solve_softobj_with_solver(start_state_np=start_state, end_state_np=end_state, solver_name='ipopt')
+    print(result)
+
+    eval_and_show(
+        mid_pos_np=result['mid_pos'],
+        vel_angles_np=result['vel_angles'],
+        traj_ts_free_np=result['traj_ts_free'],
+        start_state_np=start_state,
+        end_state_np=end_state
+    )
+
+
+
+from scipy.optimize import differential_evolution, dual_annealing, direct
+
+def create_objective_function():
+    """创建可求值的目标函数"""
+    # 创建符号变量
+    mid_pos = SYM_TYPE.sym('mid_pos', NMIDPT, NDIM)
+    vel_angles = SYM_TYPE.sym('vel_angles', NTRAJ-1, 1)
+    traj_ts_free = SYM_TYPE.sym('traj_ts_free', NTRAJ, 1)
+    start_state = SYM_TYPE.sym('start_state', S, NDIM)
+    end_state = SYM_TYPE.sym('end_state', S, NDIM)
+
+    # 构建目标函数
+    cost = objectFuncWithConstrain(
+        mid_pos=mid_pos,
+        vel_angles=vel_angles,
+        traj_ts_free=traj_ts_free,
+        start_state=start_state,
+        end_state=end_state
+    )
+
+    # 创建可调用的函数
+    return ca.Function('objective',
+                      [mid_pos, vel_angles, traj_ts_free, start_state, end_state],
+                      [cost])
+
+def evaluate_trajectory(x, obj_func, start_state_np, end_state_np):
+    """将优化变量转换为目标函数值"""
+    # 解包优化变量
+    n_mid_pos = NMIDPT * NDIM
+    n_vel_angles = NTRAJ - 1
+    n_traj_ts = NTRAJ
+
+    mid_pos = x[:n_mid_pos].reshape(NMIDPT, NDIM)
+    vel_angles = x[n_mid_pos:n_mid_pos + n_vel_angles].reshape(NTRAJ-1, 1)
+    traj_ts_free = x[n_mid_pos + n_vel_angles:].reshape(NTRAJ, 1)
+
+    # 使用CasADi函数计算目标函数值
+    cost = obj_func(mid_pos, vel_angles, traj_ts_free, start_state_np, end_state_np)
+
+    return float(cost)
+
+def solve_with_metaheuristic(start_state_np, end_state_np, method='de'):
+    """使用元启发式算法求解"""
+    # 创建目标函数
+    obj_func = create_objective_function()
+
+    # 确定优化变量的维度和范围
+    n_mid_pos = NMIDPT * NDIM
+    n_vel_angles = NTRAJ - 1
+    n_traj_ts = NTRAJ
+    total_vars = n_mid_pos + n_vel_angles + n_traj_ts
+
+    # 设定变量范围
+    bounds_pos = [(-5, 5)] * n_mid_pos  # 位置范围
+    bounds_angle = [(-np.pi, np.pi)] * n_vel_angles  # 角度范围
+    bounds_time = [(0.1, 10)] * n_traj_ts  # 时间范围
+    bounds = bounds_pos + bounds_angle + bounds_time
+
+    # 优化目标函数
+    objective = lambda x: evaluate_trajectory(x, obj_func, start_state_np, end_state_np)
+
+    start_time = time.time()
+
+    if method == 'de':
+        # 差分进化算法
+        result = differential_evolution(
+            objective,
+            bounds,
+            maxiter=100,
+            popsize=20,
+            mutation=(0.5, 1.0),
+            recombination=0.7,
+            updating='deferred',
+            workers=1  # 使用单线程避免序列化问题
+        )
+    elif method == 'annealing':
+        # 模拟退火算法
+        result = dual_annealing(
+            objective,
+            bounds,
+            maxiter=1000,
+            initial_temp=5230.0,
+            restart_temp_ratio=2e-5,
+            visit=2.62,
+            accept=-5.0
+        )
+    elif method == 'direct':
+        # DIRECT算法
+        result = direct(
+            objective,
+            bounds,
+            maxiter=100,
+            locally_biased=True
+        )
+
+    solve_time = time.time() - start_time
+
+    if result.success:
+        # 解包结果
+        x_sol = result.x
+        mid_pos = x_sol[:n_mid_pos].reshape(NMIDPT, NDIM)
+        vel_angles = x_sol[n_mid_pos:n_mid_pos + n_vel_angles].reshape(NTRAJ-1, 1)
+        traj_ts_free = x_sol[n_mid_pos + n_vel_angles:].reshape(NTRAJ, 1)
+
+        return {
+            'success': True,
+            'solve_time': solve_time,
+            'objective_value': result.fun,
+            'mid_pos': mid_pos,
+            'vel_angles': vel_angles,
+            'traj_ts_free': traj_ts_free,
+            'solver_stats': {
+                'nfev': result.nfev,
+                'nit': getattr(result, 'nit', None)
+            }
+        }
+    else:
+        return {
+            'success': False,
+            'error': 'Optimization failed',
+            'solve_time': solve_time
+        }
+
+def compare_metaheuristic_solvers(start_state_np, end_state_np):
+    """比较不同的元启发式算法"""
+    methods = ['direct']
+    results = {}
+
+    for method in methods:
+        try:
+            print(f"\nTrying {method}...")
+            result = solve_with_metaheuristic(
+                start_state_np,
+                end_state_np,
+                method
+            )
+            results[method] = result
+        except Exception as e:
+            print(f"Method {method} failed: {str(e)}")
+            results[method] = None
+
+    print_comparison(results)
+    return results
+
+def main2():
+    start_state = np.array([
+        [0.0,0.0],
+        [0.0,0.25],
+        [0.0,0.0]
+    ])
+    end_state = np.array([
+        [13.0,1.0],
+        [0.0,0.25],
+        [0.0,0.0]
+    ])
+
+    results = compare_metaheuristic_solvers(start_state, end_state)
+
+    # 找到最佳结果并可视化
+    valid_results = {k: v for k, v in results.items() if v and v['success']}
+    if valid_results:
+        best_method = min(valid_results.items(), key=lambda x: x[1]['objective_value'])[0]
+        best_result = valid_results[best_method]
+        print(f"\nBest method: {best_method}")
+
+        eval_and_show(
+            mid_pos_np=best_result['mid_pos'],
+            vel_angles_np=best_result['vel_angles'],
+            traj_ts_free_np=best_result['traj_ts_free'],
+            start_state_np=start_state,
+            end_state_np=end_state
+        )
+
 
 if __name__ == '__main__':
     main()
