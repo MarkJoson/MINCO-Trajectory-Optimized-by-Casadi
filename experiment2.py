@@ -92,23 +92,53 @@ def compute_control_input(coff_now, c_star, c_stable, kappa=0.1):
 
     return f
 
+def finite_horizon_lqr(A, B, Q, R, QN, N):
+    # 获取系统维度
+    n = A.shape[0]  # 状态维度
+    m = B.shape[1]  # 输入维度
+
+    # 初始化序列
+    P_sequence = [None] * (N + 1)
+    K_sequence = [None] * N
+
+    # 终端条件
+    P_sequence[N] = QN
+
+    # 向后递推
+    for t in range(N-1, -1, -1):
+        # 计算Riccati方程
+        P_next = P_sequence[t + 1]
+
+        # 计算K(t)
+        K = -np.linalg.inv(R + B.T @ P_next @ B) @ B.T @ P_next @ A
+        K_sequence[t] = K
+
+        # 更新P(t)
+        P = Q + A.T @ P_next @ A + A.T @ P_next @ B @ K
+        P_sequence[t] = P
+
+    return K_sequence, P_sequence
+
 class Planner:
     def __init__(self, pieceT) -> None:
-        self.pieceT = pieceT# / RATIO
+        self.pieceT = pieceT / RATIO
         mat_m_inv = np.linalg.inv(constructMincoM(self.pieceT))
-        mat_r = consturctMatR(pieceT=pieceT*RATIO)
+        mat_r = consturctMatR(pieceT=pieceT)
         mat_s = np.diag([1,1,1,1,1,0])
         mat_u = np.array([[0,0,0,0,0,1]]).T
-        mat_h = np.array([[1,0,0,0,0,0]])
+        # mat_h = constructBetaT(pieceT, 0).T
 
         self.mat_F = mat_m_inv @ mat_s @ mat_r              # matF是行向量
         self.mat_G = (mat_m_inv @ mat_u).reshape(-1,1)      # matG是列向量
 
         # LQR
-        Q = constructBBTint(pieceT=self.pieceT, rank=3)
+        # Q = constructBBTint(pieceT=pieceT, rank=3)# + np.diag([1,1,1,0,0,0])*1
+        Q = np.diag([1,0,0,0,0,0])*1
         # Q[0,0] = 1e2
-        R = np.array([[1]])     # 控制权重矩阵
-        self.K, _, _ = control.dlqr(self.mat_F+self.mat_G@mat_h, self.mat_G, Q, R)
+        R = np.array([[10]])     # 控制权重矩阵
+        self.K, _, _ = control.dlqr(self.mat_F, self.mat_G, Q, R)
+        # Kseq,Pseq = finite_horizon_lqr(self.mat_F, self.mat_G, Q, R, np.diag([1,1,1,0,0,0]), 30)
+        # self.K = Kseq[0]
         self.Kpp = sl.pinv(self.mat_G) @ (np.identity(6)-self.mat_F)+self.K
 
         # STAB
@@ -122,20 +152,7 @@ class Planner:
     def iter_func_new(self, tgt_pos, last_coff):
         """修改后的迭代更新函数"""
         tgt_pos = tgt_pos.reshape(1,-1)
-        # c_star = calc_target_coefficient(tgt_pos)
 
-        # f = compute_control_input(last_coff, c_star, calc_target_coefficient(-K @ last_coff + Kpp @ c_star))
-        # f_trans = np.linalg.pinv(mat_G) @ ((np.identity(NCOFF)-mat_F) @ last_coff + f)
-
-        # 状态更新
-        # new_coff = mat_F@last_coff + mat_G@f_trans
-        # new_coff = mat_F@last_coff + mat_G @ constructBetaT(pieceT,0).T@(last_coff)
-        # new_coff = self.mat_F@last_coff + self.mat_G @ (-self.K @ last_coff + self.Kpp @ c_star)
-        # new_coff = mat_F@last_coff + mat_G @ (Kpp @ c_star)
-        # new_coff = mat_F@last_coff + mat_G @ (constructBetaT(pieceT,0).T@(f))
-        # new_coff = mat_F@last_coff + mat_G @ (tgt_pos)
-
-        # new_coff = self.mat_F@last_coff + self.mat_G@tgt_pos
         new_coff = self.mat_F_stab@last_coff + self.mat_G_stab@tgt_pos
 
         return new_coff
@@ -154,6 +171,7 @@ class Planner:
         ts = [((i+1)/(nckpt+1)*self.pieceT) for i in range(nckpt)]
         vel_bounds = np.concatenate([self.calc_bound(t, 1, 2, coff) for t in ts], axis=1)
         acc_bounds = np.concatenate([self.calc_bound(t, 2, 3, coff) for t in ts], axis=1)
+        # jerk_bounds = np.concatenate([self.calc_bound(t, 3, 300, coff) for t in ts], axis=1)
         bounds = np.concatenate([vel_bounds, acc_bounds], axis=1)
 
         lb = np.max(bounds[0,:], axis=0)
@@ -183,12 +201,12 @@ def main():
     coff = constructInitialCoff(init_pos)
 
     for i in range(ITER_TIMES):
-        tgt_pos = square_tgts[(i//200)%4,:]
+        tgt_pos = square_tgts[(i//80)%4,:]
         # tgt_pos = np.random.rand(2)
-        # tgt_pos = np.array([1,0])
+        tgt_pos = np.array([20,20])
 
         # [upper[x, y], lower[x, y]]
-        bound = planner.bound_all(coff=coff, nckpt=20)
+        bound = planner.bound_all(coff=coff, nckpt=100)
         new_tgt_pos = np.clip(tgt_pos, bound[0], bound[1])
 
         # print("bound.x=(%.2f, %.2f), y(%.2f,%.2f) ---- old_tgt=(%.2f,%.2f) ---- new_tgt=(%.2f,%.2f)" % (
@@ -196,14 +214,14 @@ def main():
         #     tgt_pos[0],tgt_pos[1],new_tgt_pos[0],new_tgt_pos[1],))
         # print("\n\n")
 
-        coff = planner.iter_func_new(new_tgt_pos, coff)
+        coff = planner.iter_func(new_tgt_pos, coff)
 
         # print(constructBetaT(pieceT, 0).T @ coff)
         coffs.append(coff)
 
     coffs = np.array(coffs)
     coffs = coffs.reshape(-1, 2)
-    result = eval_fn.call({"T":pieceT*RATIO , "coff":coffs})
+    result = eval_fn.call({"T":pieceT , "coff":coffs})
 
 
     eval_result = {
