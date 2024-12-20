@@ -21,8 +21,8 @@ def create_visualization(eval_result, total_time):
     """
     # Convert casadi DM objects to numpy arrays and reshape
     pos = np.array(eval_result['positions'])
-    vel = np.array(eval_result['velocities'])
-    acc = np.array(eval_result['accelerates'])
+    vel = np.array(eval_result['jerks'])
+    acc = np.array(eval_result['snaps'])
     cur = np.array(eval_result['curvatures_sq'])
 
     # Reshape arrays from (n,2) to (2,n)
@@ -102,6 +102,7 @@ def create_visualization(eval_result, total_time):
     def animate(i):
         # Update particle position - 修正这里
         particle.set_data([pos[0, i]], [pos[1, i]])  # 使用列表包装单个值
+        # print(pos[:,i])
 
         # Update velocity arrow
         vel_arrow.set_offsets(np.column_stack((pos[0, i], pos[1, i])))

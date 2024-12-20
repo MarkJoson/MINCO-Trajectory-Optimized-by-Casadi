@@ -12,44 +12,44 @@ __all__ = [
 ]
 
 
-def constructBetaT(t, rank:int):
+def constructBetaT(t, rank:int, SYMT=SYM_TYPE):
     ''' 构造特定时间的β(t) '''
-    beta = SYM_TYPE(NCOFF, 1)
+    beta = SYMT(NCOFF, 1)
     for i in range(rank, NCOFF):
         if not isinstance(t, int|float) or t!=0 or i-rank==0:
-            beta[i] = math.factorial(i)/math.factorial(i-rank) * t**(i-rank)
+            beta[i,0] = math.factorial(i)/math.factorial(i-rank) * t**(i-rank)
     return beta
 
-def constructEi(T):
+def constructEi(T, SYMT=SYM_TYPE):
     ''' 构造M矩阵中的Ei(2s*2s)=[β(T), β(T), ..., β(T)^(2s-2)] '''
-    Ei = SYM_TYPE(NCOFF, NCOFF)
-    Ei[0, :] = constructBetaT(T, 0)
+    Ei = SYMT(NCOFF, NCOFF)
+    Ei[0, :] = constructBetaT(T, 0, SYMT)
     for i in range(1, NCOFF):
-        Ei[i, :] = constructBetaT(T, i-1)
+        Ei[i, :] = constructBetaT(T, i-1, SYMT)
     return Ei
 
-def constructFi():
+def constructFi(SYMT=SYM_TYPE):
     ''' 构造M矩阵中的Fi(2s*2s)=[0, -β(0), ..., β(0)^(2s-2)] '''
-    Fi = SYM_TYPE(NCOFF, NCOFF)
+    Fi = SYMT(NCOFF, NCOFF)
     for i in range(1, NCOFF):
-        Fi[i, :] = -constructBetaT(0, i-1)
+        Fi[i, :] = -constructBetaT(0, i-1, SYMT)
     return Fi
 
-def constructF0():
+def constructF0(SYMT=SYM_TYPE):
     ''' 构造M矩阵中的F0(s*2s)=[β(0), ..., β(0)^(s-1)] '''
-    F0 = SYM_TYPE(S, NCOFF)      # 端点约束
+    F0 = SYMT(S, NCOFF)      # 端点约束
     for i in range(S):
-        F0[i, :] = constructBetaT(0, i)
+        F0[i, :] = constructBetaT(0, i, SYMT)
     return F0
 
-def constructEM(T):
+def constructEM(T,SYMT=SYM_TYPE):
     ''' 构造M矩阵中的E0(s*2s)=[β(T), ..., β(T)^(s-1)] '''
-    E0 = SYM_TYPE(S, NCOFF)      # 端点约束
+    E0 = SYMT(S, NCOFF)      # 端点约束
     for i in range(S):
-        E0[i, :] = constructBetaT(T, i)
+        E0[i, :] = constructBetaT(T, i, SYMT)
     return E0
 
-def constructM(pieceT, num_pieces):
+def constructM(pieceT, num_pieces, SYMT=SYM_TYPE):
     ''' 构造矩阵M=[
         [F0,    0,      0,      0,    ...,    ],
         [E1,   F1,      0,      0,    ...,    ],
@@ -57,16 +57,16 @@ def constructM(pieceT, num_pieces):
         ...
     ]
     '''
-    M = SYM_TYPE(num_pieces*NCOFF, num_pieces*NCOFF)
+    M = SYMT(num_pieces*NCOFF, num_pieces*NCOFF)
     # F0 = SYM_TYPE.sym('F0', 3, 6)
     # EM = SYM_TYPE.sym('EM', 3, 6)
-    M[0:S, 0:NCOFF] = constructF0()         # 3*6
-    M[-S:, -NCOFF:] = constructEM(T=pieceT) # 3*6
+    M[0:S, 0:NCOFF] = constructF0(SYMT)         # 3*6
+    M[-S:, -NCOFF:] = constructEM(T=pieceT, SYMT=SYMT) # 3*6
     for i in range(1, num_pieces):
         # Fi = SYM_TYPE.sym(f'F{i}', 6, 6)
         # Ei = SYM_TYPE.sym(f'E{i}', 6, 6)
-        M[(i-1)*NCOFF+S:i*NCOFF+S, (i-1)*NCOFF:i*NCOFF] = constructEi(pieceT)
-        M[(i-1)*NCOFF+S:i*NCOFF+S, i*NCOFF:(i+1)*NCOFF] = constructFi()
+        M[(i-1)*NCOFF+S:i*NCOFF+S, (i-1)*NCOFF:i*NCOFF] = constructEi(pieceT, SYMT)
+        M[(i-1)*NCOFF+S:i*NCOFF+S, i*NCOFF:(i+1)*NCOFF] = constructFi(SYMT)
     return M
 
 def constructB(state0, stateT, mid_pos, num_pieces):
@@ -86,7 +86,7 @@ def constructBBTint(pieceT, rank):
         for j in range(NCOFF):
             if i+j-2*rank < 0: continue
             coff = 1 / (i+j-2*rank+1)
-            bbint[i, j] = coff * beta[i] * beta[j] * pieceT
+            bbint[i, j] = coff * beta[i,0] * beta[j,0] * pieceT
     return bbint
 
 def L1_func(x):
@@ -107,7 +107,7 @@ def tau2T_func(tau):
     # f2 = (tau**2 - 2*tau + 2)/2  # tau <= 0
     # Tf = ca.if_else(tau > 0, f1, f2)
 
-    return tau**2+0.01
+    return tau**2+1e-2
 
 def softmax_func(x):
     return 1 / (1 + ca.exp(-x))
@@ -134,15 +134,19 @@ def constructNPiecesCkptMat(pieceT, rank:int, nckpt:int, npiece:int):
 def create_poly_eval_func(n_piece, n_drawpt):
     '''多项式评估函数，输入多项式系数，输出采样点'''
     T = SYM_TYPE.sym('T') # type: ignore
-    coff = SYM_TYPE.sym('coff', n_piece, NDIM) # type: ignore
+    coff = SYM_TYPE.sym('coff', NCOFF*n_piece, NDIM) # type: ignore
 
     pos_ckpt_mat = constructNPiecesCkptMat(pieceT=T, rank=0, nckpt=n_drawpt, npiece=n_piece)
     vel_ckpt_mat = constructNPiecesCkptMat(pieceT=T, rank=1, nckpt=n_drawpt, npiece=n_piece)
     acc_ckpt_mat = constructNPiecesCkptMat(pieceT=T, rank=2, nckpt=n_drawpt, npiece=n_piece)
+    jerk_ckpt_mat = constructNPiecesCkptMat(pieceT=T, rank=3, nckpt=n_drawpt, npiece=n_piece)
+    snap_ckpt_mat = constructNPiecesCkptMat(pieceT=T, rank=4, nckpt=n_drawpt, npiece=n_piece)
 
     pos_ckpts = pos_ckpt_mat.T @ coff
     vel_ckpts = vel_ckpt_mat.T @ coff
     acc_ckpts = acc_ckpt_mat.T @ coff
+    jerk_ckpts = jerk_ckpt_mat.T @ coff
+    snap_ckpts = snap_ckpt_mat.T @ coff
 
     vels_sqsum = ca.sum2(vel_ckpts ** 2)
 
@@ -150,7 +154,13 @@ def create_poly_eval_func(n_piece, n_drawpt):
     denominator = vels_sqsum**3
     curvature_sq_ckpts = numerator / (denominator)
 
-    return ca.Function('poly_eval', [T, coff], [pos_ckpts, vel_ckpts, acc_ckpts, curvature_sq_ckpts])
+    return ca.Function(
+        'poly_eval',
+        [T, coff],
+        [pos_ckpts, vel_ckpts, acc_ckpts, curvature_sq_ckpts, jerk_ckpts, snap_ckpts],
+        ["T", "coff"],
+        ["pos_ckpts", "vel_ckpts", "acc_ckpts", "curvature_sq_ckpts", "jerk_ckpts", "snap_ckpts"]
+    )
 
 
 def create_traj_eval_func(n_piece, n_drawpt, n_mid_pos):
@@ -166,4 +176,12 @@ def create_traj_eval_func(n_piece, n_drawpt, n_mid_pos):
     B = constructB(state0=state0, stateT=stateT, mid_pos=mid_pos, num_pieces=n_piece)
     c = ca.solve(M, B)
 
-    return ca.Function('mmp_eval', [T, state0, stateT, mid_pos], [poly_eval_fn(T, c)])
+    result = poly_eval_fn.call({"T":T, "coff":c})
+
+    return ca.Function(
+        'mmp_eval',
+        [T, state0, stateT, mid_pos],
+        [c, *result.values()],
+        ["T","state0","stateT","mid_pos"],
+        ["coff", *result.keys()]
+    )

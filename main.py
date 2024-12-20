@@ -10,9 +10,11 @@ from debug_casadi import print_matrix, print_structured_matrix
 from config import *
 from toolbox import *
 
+np.set_printoptions(precision=50)
+
 # 轨迹优化参数
 NTRAJ     = 1         # 轨迹条数
-NPIECE    = 1         # 5阶段轨迹曲线
+NPIECE    = 5         # 5阶段轨迹曲线
 NMIDPT    = NTRAJ*NPIECE-1      # 中间路径点（优化变量）个数
 NCKPT     = 20        # 检查点个数
 NDRAW_PT  = 50
@@ -26,18 +28,23 @@ max_acc_sq = 3
 max_cur_sq = 1.5
 
 # 优化权重
-weight_dt = 0.1
-weight_vel = 1000.0
-weight_acc = 1000.0
-weight_cur = 1000.0
+weight_dt = 10
+weight_vel = 0*1000.0
+weight_acc = 0*1000.0
+weight_cur = 0*1000.0
 
 
-def constructStateByPosAndDir(pos, vel_amptitude, vel_theta, vel_sign):
-    ret = SYM_TYPE(S, NDIM)
+def create_state_by_pos_dir_func():
+    pos = ca.SX.sym('pos', NDIM)
+    vel_amp = ca.SX.sym('vel_amp')
+    vel_theta = ca.SX.sym('vel_theta')
+    vel_sign = ca.SX.sym('vel_sign')
+
+    ret = ca.SX(S, NDIM)
     ret[0, :] = pos
-    ret[1, 0] = ca.cos(vel_theta) * vel_amptitude * vel_sign
-    ret[1, 1] = ca.sin(vel_theta) * vel_amptitude * vel_sign
-    return ret
+    ret[1, 0] = ca.cos(vel_theta) * vel_amp * vel_sign
+    ret[1, 1] = ca.sin(vel_theta) * vel_amp * vel_sign
+    return ca.Function('state_by_pos_dir', [pos, vel_amp, vel_theta, vel_sign], [ret])
 
 
 def objectFuncWithConstrain(mid_pos, vel_angles, traj_ts_free, start_state, end_state):
@@ -52,13 +59,14 @@ def objectFuncWithConstrain(mid_pos, vel_angles, traj_ts_free, start_state, end_
 
     cost =  0
     traj_ts = tau2T_func(traj_ts_free)
+    state_by_pos_dir_fn = create_state_by_pos_dir_func()
     for i in range(NTRAJ):
         # 本段轨迹的piece时长
         pieceT = traj_ts[i] / NPIECE
 
         # 计算本段轨迹的起点和终点
-        state0 = start_state if i==0 else constructStateByPosAndDir(mid_pos[i*NPIECE-1, :], VEL_SHIFT, vel_angles[i-1], -1)
-        stateT = end_state if i==NTRAJ-1 else constructStateByPosAndDir(mid_pos[(i+1)*NPIECE-1, :], VEL_SHIFT, vel_angles[i], 1)
+        state0 = start_state if i==0 else state_by_pos_dir_fn(mid_pos[i*NPIECE-1, :], VEL_SHIFT, vel_angles[i-1,0], -1)
+        stateT = end_state if i==NTRAJ-1 else state_by_pos_dir_fn(mid_pos[(i+1)*NPIECE-1, :], VEL_SHIFT, vel_angles[i,0], 1)
 
         # 求解本段轨迹的多项式系数矩阵
         traj_mid_pos = mid_pos[i*NPIECE:(i+1)*NPIECE-1, :]
@@ -167,7 +175,8 @@ def solve_softobj_with_solver(start_state_np, end_state_np, solver_name: str) ->
     # 定义变量
     mid_pos = opti.variable(NMIDPT, NDIM)
     vel_angles = opti.variable(NTRAJ-1, 1)
-    traj_ts_free = opti.variable(NTRAJ, 1)
+    traj_ts_free = ca.DM(np.ones((NTRAJ))*8)
+    # traj_ts_free = opti.variable(NTRAJ, 1)
 
     # 设置初值
 
@@ -178,7 +187,7 @@ def solve_softobj_with_solver(start_state_np, end_state_np, solver_name: str) ->
     #    [ 1.00264075,  0.11095673]]))
     opti.set_initial(mid_pos, np.array([end_state_np[0,:]*(i+1)/(NMIDPT+1)+start_state_np[0,:]*(1-(i+1)/(NMIDPT+1)) for i in range(NMIDPT)]))
     opti.set_initial(vel_angles, np.array([ca.pi]))
-    opti.set_initial(traj_ts_free, np.array([0.1]))
+    # opti.set_initial(traj_ts_free, np.array([0.1]))
 
     # 设置目标函数
     opti.minimize(objectFuncWithConstrain(
@@ -272,8 +281,15 @@ def evaluate(mid_pos, vel_angles, traj_ts_free, start_state, end_state):
     velocities = np.zeros((NTRAJ*NPIECE*NDRAW_PT, NDIM))
     accelerates = np.zeros((NTRAJ*NPIECE*NDRAW_PT, NDIM))
     curvatures_sq = np.zeros((NTRAJ*NPIECE*NDRAW_PT, 1))
+    jerks = np.zeros((NTRAJ*NPIECE*NDRAW_PT, NDIM))
+    snaps = np.zeros((NTRAJ*NPIECE*NDRAW_PT, NDIM))
+
+    mid_pos = np.array(mid_pos).reshape(-1, NDIM)
+    vel_angles = np.array(vel_angles).reshape(-1)
+    traj_ts_free = np.array(traj_ts_free).reshape(-1)
 
     traj_eval_fn = create_traj_eval_func(n_piece=NPIECE, n_drawpt=NDRAW_PT, n_mid_pos=NPIECE-1)
+    state_by_pos_dir_fn = create_state_by_pos_dir_func()
 
     traj_ts = tau2T_func(traj_ts_free)
 
@@ -281,23 +297,37 @@ def evaluate(mid_pos, vel_angles, traj_ts_free, start_state, end_state):
         pieceT = traj_ts[i] / NPIECE
         traj_mid_pos = mid_pos[i*NPIECE:(i+1)*NPIECE-1, :]
 
-        state0 = start_state if i==0 else constructStateByPosAndDir(mid_pos[i*NPIECE-1, :], VEL_SHIFT, vel_angles[i-1], -1)
-        stateT = end_state if i==NTRAJ-1 else constructStateByPosAndDir(mid_pos[(i+1)*NPIECE-1, :], VEL_SHIFT, vel_angles[i], 1)
+        state0 = start_state if i==0 else state_by_pos_dir_fn(mid_pos[i*NPIECE-1, :], VEL_SHIFT, vel_angles[i-1], -1)
+        stateT = end_state if i==NTRAJ-1 else state_by_pos_dir_fn(mid_pos[(i+1)*NPIECE-1, :], VEL_SHIFT, vel_angles[i], 1)
 
-        pos_ckpts, vel_ckpts, acc_ckpts, curvature_sq_ckpts = traj_eval_fn.call(pieceT, state0, stateT, traj_mid_pos)
+        # stateT = np.array(stateT.to_DM())
+        result = traj_eval_fn.call({"T":pieceT, "state0":state0, "stateT":stateT, "mid_pos":traj_mid_pos})
 
         start_ind = i*NPIECE*NDRAW_PT
         end_ind = start_ind + NPIECE*NDRAW_PT
-        positions[start_ind:end_ind, :] = pos_ckpts
-        velocities[start_ind:end_ind, :] = vel_ckpts
-        accelerates[start_ind:end_ind, :] = acc_ckpts
-        curvatures_sq[start_ind:end_ind, :] = curvature_sq_ckpts
+        positions[start_ind:end_ind, :] = result["pos_ckpts"]
+        velocities[start_ind:end_ind, :] = result["vel_ckpts"]
+        accelerates[start_ind:end_ind, :] = result["acc_ckpts"]
+        curvatures_sq[start_ind:end_ind, :] = result["curvature_sq_ckpts"]
+        jerks[start_ind:end_ind, :] = result["jerk_ckpts"]
+        snaps[start_ind:end_ind, :] = result["snap_ckpts"]
+
+        print(np.array(result["coff"]))
+
+        # print(f"----------{constructBetaT(0,0,ca.SX).T @ result['coff'][:6,:]}")
+        # print(f"----------{constructBetaT(0,1,ca.SX).T @ result['coff'][:6,:]}")
+        # print(f"----------{constructBetaT(0,2,ca.SX).T @ result['coff'][:6,:]}")
+        # print(f"----------{constructBetaT(0,3,ca.SX).T @ result['coff'][:6,:]}")
+        # print(f"----------{constructBetaT(0,4,ca.SX).T @ result['coff'][:6,:]}")
+
 
     eval_result = {
         "positions":positions,
         "velocities":velocities,
         "accelerates":accelerates,
         "curvatures_sq":curvatures_sq,
+        "jerks":jerks,
+        "snaps":snaps,
     }
     create_visualization(eval_result=eval_result, total_time=np.sum(traj_ts))
 
@@ -305,7 +335,7 @@ def evaluate(mid_pos, vel_angles, traj_ts_free, start_state, end_state):
 def main():
     start_state = np.array([
         [0.0,0.0],
-        [0.0,0.25],
+        [0.0,-0.5],
         [0.0,0.0]
     ])
     end_state = np.array([
@@ -327,5 +357,5 @@ def main():
 
 
 if __name__ == '__main__':
-    # main()
-    test_obj_func()
+    main()
+    # test_obj_func()
