@@ -152,7 +152,7 @@ def create_poly_eval_func(n_piece, n_drawpt):
 
     numerator = (vel_ckpts[:,0]*acc_ckpts[:,1] - vel_ckpts[:,1]*acc_ckpts[:,0])**2
     denominator = vels_sqsum**3
-    curvature_sq_ckpts = numerator / (denominator)
+    curvature_sq_ckpts = numerator / (denominator+1e-6)
 
     return ca.Function(
         'poly_eval',

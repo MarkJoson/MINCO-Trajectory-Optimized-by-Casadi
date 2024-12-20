@@ -5,10 +5,15 @@ from config import *
 import toolbox as tb
 from debug_casadi import *
 from evaluate import create_visualization
-import copy
+import scipy.linalg as sl
+import control
 
-ITER_TIMES = 4
-DRAWPT_PER_PIECE = 50
+ITER_TIMES = 200
+DRAWPT_PER_PIECE = 1
+
+RATIO = 0.1
+
+np.set_printoptions(2)
 
 def constructBetaT(t, rank:int):
     ''' 构造特定时间的β(t) '''
@@ -17,6 +22,18 @@ def constructBetaT(t, rank:int):
         if not isinstance(t, int|float) or t!=0 or i-rank==0:
             beta[i,0] = math.factorial(i)/math.factorial(i-rank) * t**(i-rank)
     return beta
+
+def constructBBTint(pieceT, rank):
+    ''' c^T*(∫β*β^T*dt)*c ==> (2, NCOFF) * (NCOFF, NCOFF) * (NCOFF, 2) '''
+    bbint = np.zeros((NCOFF, NCOFF))
+    beta = constructBetaT(pieceT, rank)
+    for i in range(NCOFF):
+        for j in range(NCOFF):
+            if i+j-2*rank < 0: continue
+            coff = 1 / (i+j-2*rank+1)
+            bbint[i, j] = coff * beta[i,0] * beta[j,0] * pieceT
+    return bbint
+
 
 def constructMincoM(pieceT):
     mat_m = np.zeros((NCOFF, NCOFF), dtype=np.float64)
@@ -27,15 +44,16 @@ def constructMincoM(pieceT):
     return mat_m
 
 def constructMincoQ(last_coff, tgtPos, pieceT):
-    mat_q = np.zeros((NCOFF, NDIM), dtype=np.float64)
-    mat_ck = np.zeros((NCOFF-1, NCOFF), dtype=np.float64)
-
-    for i in range(NCOFF-1):
-        mat_ck[i, :] = constructBetaT(pieceT, i).T
-
-    mat_q[:NCOFF-1, :] = mat_ck @ last_coff
+    mat_r = consturctMatR(pieceT=pieceT)
+    mat_q = mat_r @ last_coff
     mat_q[-1, :] = tgtPos
     return mat_q
+
+def consturctMatR(pieceT):
+    mat_r = np.zeros((NCOFF, NCOFF), dtype=np.float64)
+    for i in range(NCOFF):
+        mat_r[i, :] = constructBetaT(pieceT, i).T
+    return mat_r
 
 def constructInitialCoff(init_pos):
     coff = np.zeros((NCOFF, NDIM), dtype=np.float64)
@@ -43,116 +61,150 @@ def constructInitialCoff(init_pos):
     return coff
     # init_state = ca.SX.sym('init_state', NCOFF, NDIM) # type: ignore
 
-def iter_func(pieceT, tgt_pos, last_coff):
-    mat_m = constructMincoM(pieceT)
-    mat_q = constructMincoQ(last_coff, tgt_pos, pieceT)
-    new_coff = np.linalg.inv(mat_m) @ mat_q
-    # new_coff = ca.solve(mat_m, mat_q)
-    return new_coff
+def calc_target_coefficient(u):
+    """计算目标系数c*(u)"""
+    c_star = np.zeros((NCOFF, NDIM))
+    c_star[0,:] = u  # 常数项设为目标位置
+    return c_star
+
+def calc_lyapunov(c):
+    """计算李亚普诺夫函数V(c)"""
+    # ts = [((i+1)/(nckpt+1)*pieceT) for i in range(nckpt)]
+
+    Q = np.diag([0, 10,100,1000,0,0])
+    V = np.sum(c.T @ Q @ c)  # V = eᵀQe
+    return V
+
+def nonlinear_scaling(c, c_star, k=0.01):
+    """非线性缩放函数α(θ)"""
+
+    curV = calc_lyapunov(c)
+    dV = calc_lyapunov(c_star) - curV
+    maxV = calc_lyapunov(np.array([[0,0], [0.1,0.1], [0.1,0.1], [0,0], [0,0], [0,0],]))
+
+    return 1#1 / (1.0 + np.exp((curV-maxV)/k))
+
+def compute_control_input(coff_now, c_star, c_stable, kappa=0.1):
+    """计算非线性控制输入f(u,c)"""
+    alpha = nonlinear_scaling(coff_now, c_star)
+    error = c_star - coff_now
+    f = alpha * (c_stable-c_star) + c_star
+
+    return f
+
+class Planner:
+    def __init__(self, pieceT) -> None:
+        self.pieceT = pieceT# / RATIO
+        mat_m_inv = np.linalg.inv(constructMincoM(self.pieceT))
+        mat_r = consturctMatR(pieceT=pieceT*RATIO)
+        mat_s = np.diag([1,1,1,1,1,0])
+        mat_u = np.array([[0,0,0,0,0,1]]).T
+        mat_h = np.array([[1,0,0,0,0,0]])
+
+        self.mat_F = mat_m_inv @ mat_s @ mat_r              # matF是行向量
+        self.mat_G = (mat_m_inv @ mat_u).reshape(-1,1)      # matG是列向量
+
+        # LQR
+        Q = constructBBTint(pieceT=self.pieceT, rank=3)
+        # Q[0,0] = 1e2
+        R = np.array([[1]])     # 控制权重矩阵
+        self.K, _, _ = control.dlqr(self.mat_F+self.mat_G@mat_h, self.mat_G, Q, R)
+        self.Kpp = sl.pinv(self.mat_G) @ (np.identity(6)-self.mat_F)+self.K
+
+        # STAB
+        self.mat_F_stab = self.mat_F - self.mat_G @ self.K
+        self.mat_G_stab = self.mat_G @ self.Kpp @ np.array([[1,0,0,0,0,0]]).T
+
+    def iter_func(self, tgt_pos, last_coff):
+        new_coff = self.mat_F @ last_coff + self.mat_G @ tgt_pos.reshape(1,-1)
+        return new_coff
+
+    def iter_func_new(self, tgt_pos, last_coff):
+        """修改后的迭代更新函数"""
+        tgt_pos = tgt_pos.reshape(1,-1)
+        # c_star = calc_target_coefficient(tgt_pos)
+
+        # f = compute_control_input(last_coff, c_star, calc_target_coefficient(-K @ last_coff + Kpp @ c_star))
+        # f_trans = np.linalg.pinv(mat_G) @ ((np.identity(NCOFF)-mat_F) @ last_coff + f)
+
+        # 状态更新
+        # new_coff = mat_F@last_coff + mat_G@f_trans
+        # new_coff = mat_F@last_coff + mat_G @ constructBetaT(pieceT,0).T@(last_coff)
+        # new_coff = self.mat_F@last_coff + self.mat_G @ (-self.K @ last_coff + self.Kpp @ c_star)
+        # new_coff = mat_F@last_coff + mat_G @ (Kpp @ c_star)
+        # new_coff = mat_F@last_coff + mat_G @ (constructBetaT(pieceT,0).T@(f))
+        # new_coff = mat_F@last_coff + mat_G @ (tgt_pos)
+
+        # new_coff = self.mat_F@last_coff + self.mat_G@tgt_pos
+        new_coff = self.mat_F_stab@last_coff + self.mat_G_stab@tgt_pos
+
+        return new_coff
+
+    # pT = (beta^T * M^-1 * b) * [vi - beta^T * M^-1 * S * c_old]
+    def calc_bound(self, t, rank, val, coff):
+        const_coeff = constructBetaT(t, rank).T @ self.mat_F_stab
+        bound_coeff = constructBetaT(t, rank).T @ self.mat_G_stab
+
+        val = -val if bound_coeff < 0 else val
+
+        return np.array([(-val - const_coeff@coff)/bound_coeff, (val - const_coeff@coff)/bound_coeff])
 
 
+    def bound_all(self, coff, nckpt):
+        ts = [((i+1)/(nckpt+1)*self.pieceT) for i in range(nckpt)]
+        vel_bounds = np.concatenate([self.calc_bound(t, 1, 2, coff) for t in ts], axis=1)
+        acc_bounds = np.concatenate([self.calc_bound(t, 2, 3, coff) for t in ts], axis=1)
+        bounds = np.concatenate([vel_bounds, acc_bounds], axis=1)
 
-
-# pT = (beta^T * M^-1 * b) * [vi - beta^T * M^-1 * S * c_old]
-def calc_bound(t, pieceT, rank, val, coff):
-    mat_m = constructMincoM(pieceT)
-    mat_m_inv = np.linalg.inv(mat_m)
-
-    mat_r = np.zeros((NCOFF, NCOFF), dtype=np.float64)
-    for i in range(NCOFF):
-        mat_r[i, :] = constructBetaT(pieceT, i).T
-
-
-    mat_s = np.diag([1,1,1,1,1,0])
-    mat_u = np.array([[0,0,0,0,0,1]]).T
-
-    tmp = constructBetaT(t, rank).T @ mat_m_inv
-
-    mat_p = tmp @ mat_u
-    mat_q = tmp @ mat_s @ mat_r
-
-    if mat_p < 0:
-        val = -val
-
-    return np.array([(-val - mat_q@coff)/mat_p, (val - mat_q@coff)/mat_p])
-
-
-def bound_all(pieceT, rank, val, coff, nckpt):
-    ts = [((i+1)/(nckpt+1)*pieceT) for i in range(nckpt)]
-    bounds = np.vstack([[calc_bound(t, pieceT, rank, val, coff)] for t in ts])
-
-    lb = np.max(bounds[:,0], axis=0)
-    rb = np.min(bounds[:,1], axis=0)
-    return np.array([lb, rb])
-
-# def buildIterFunc():
-#     pieceT = ca.SX.sym('T') # type: ignore
-#     tgt_pos = ca.SX.sym('tgt_pos', NDIM) # type: ignore
-#     last_coff = ca.SX.sym('last_coff', NCOFF, NDIM) # type: ignore
-
-#     mat_m = constructMincoM(pieceT)
-#     mat_q = constructMincoQ(last_coff, tgt_pos, pieceT)
-#     new_coff = ca.solve(mat_m, mat_q)
-
-#     return ca.Function('iter_fn', [pieceT, tgt_pos, last_coff], [new_coff])
+        lb = np.max(bounds[0,:], axis=0)
+        ub = np.min(bounds[1,:], axis=0)
+        return np.array([lb, ub])
 
 
 def main():
     # iter_fn = buildIterFunc()
     eval_fn = tb.create_poly_eval_func(n_piece=ITER_TIMES, n_drawpt=DRAWPT_PER_PIECE)
 
-    pieceT = (8**2 + 0.01) / 5
+    # pieceT = (8**2 + 0.01) / 5
+    pieceT = 0.1
     init_pos = np.array([0, 0])
     tgt_pos = np.array([1, 0])
 
-    tgts = np.array([
-        # [ 0.05791999999991071 , -0.03581759999628159 ],
-       [ 0.31744000000001155 , -7.804099199999875   ],
-       [ 0.6825600000000079  , -6.482932799999943   ],
-       [ 0.9420800000000021  , -3.318278399999993   ],
-       [1,0]
+    planner = Planner(pieceT=pieceT)
+
+    square_tgts = np.array([
+       [0,1],
+       [1,1],
+       [1,0],
+       [0,0],
     ])
 
     coffs = list()
-    # coff = constructInitialCoff(init_pos)
-    coff = np.array([
-        [-1.2631629528194653e-17,  1.5383701491068513e-15],
-        [ 6.9025828012988348e-19, -5.0000000000000022e-01],
-        [-2.3903564548352504e-18, -3.3124187071162540e-16],
-        [ 3.8129096849303771e-05,  4.8812869786482533e-04],
-        [-8.9351109629695727e-07, -8.5790467910970034e-06],
-        [ 5.5835719187474023e-09,  4.4675554814892354e-08],
-    ])
+    coff = constructInitialCoff(init_pos)
 
     for i in range(ITER_TIMES):
-        tgt_pos = tgts[i,:]
-        tgt_pos = np.random.rand(1,2)
+        tgt_pos = square_tgts[(i//200)%4,:]
+        # tgt_pos = np.random.rand(2)
+        # tgt_pos = np.array([1,0])
 
         # [upper[x, y], lower[x, y]]
-        bound_vel = bound_all(pieceT=pieceT, rank=1, val=0.4, coff=coff, nckpt=5)
-        bound_acc = bound_all(pieceT=pieceT, rank=2, val=0.03, coff=coff, nckpt=5)
-        bounds = np.concatenate([[bound_vel], [bound_acc]])
-        lb = np.max(bounds[:,0], axis=0)
-        rb = np.min(bounds[:,1], axis=0)
-        bound = np.array([lb, rb])
+        bound = planner.bound_all(coff=coff, nckpt=20)
+        new_tgt_pos = np.clip(tgt_pos, bound[0], bound[1])
 
-        (rb-lb)
+        # print("bound.x=(%.2f, %.2f), y(%.2f,%.2f) ---- old_tgt=(%.2f,%.2f) ---- new_tgt=(%.2f,%.2f)" % (
+        #     bound[0][0],bound[1][0], bound[0][0],bound[1][0],
+        #     tgt_pos[0],tgt_pos[1],new_tgt_pos[0],new_tgt_pos[1],))
+        # print("\n\n")
 
-        new_tgt_pos = np.clip(tgt_pos, bound[0,0], bound[1,0])
-        print(f"iter:{i}, bound={bound}")
-        print(f"iter:{i}, past:{tgt_pos}, new:{new_tgt_pos}")
+        coff = planner.iter_func_new(new_tgt_pos, coff)
 
-        coff = iter_func(pieceT, new_tgt_pos, coff)   # 迭代更新coff
+        # print(constructBetaT(pieceT, 0).T @ coff)
         coffs.append(coff)
 
     coffs = np.array(coffs)
     coffs = coffs.reshape(-1, 2)
-    # print(coffs)
-    result = eval_fn.call({"T":pieceT, "coff":coffs})
+    result = eval_fn.call({"T":pieceT*RATIO , "coff":coffs})
 
-    # "pos_ckpts", "vel_ckpts", "acc_ckpts", "curvature_sq_ckpts", "jerk_ckpts", "snap_ckpts"
-    # positions = np.clip(result["pos_ckpts"], -5, 5)
-    # print(positions)
 
     eval_result = {
         "positions":result["pos_ckpts"],
