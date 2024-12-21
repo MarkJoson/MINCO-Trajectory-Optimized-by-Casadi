@@ -9,9 +9,10 @@ import scipy.linalg as sl
 import control
 
 ITER_TIMES = 200
-DRAWPT_PER_PIECE = 1
+DRAWPT_PER_PIECE = 2
 
 RATIO = 0.1
+
 
 np.set_printoptions(2)
 
@@ -42,6 +43,24 @@ def constructMincoM(pieceT):
 
     mat_m[-1, :] = constructBetaT(pieceT, 0).T
     return mat_m
+
+def constructMincoM2(pieceT):
+
+    mat_m = np.zeros((NCOFF, NCOFF), dtype=np.float64)
+    for i in range(NCOFF-2):
+        mat_m[i, :] = constructBetaT(0, i).T
+
+    mat_m[-2, :] = constructBetaT(pieceT, 0).T
+    mat_m[-1, :] = constructBetaT(pieceT, 1).T
+
+    mat_m_inv = np.linalg.inv(mat_m)
+    mat_supp = np.array([[0,0,0,0,0,1]]) @ mat_m_inv @ constructBBTint(pieceT=pieceT, rank=S)
+
+    mat_m[-1, :] = mat_supp[-1, :]
+
+    return mat_m
+
+
 
 def constructMincoQ(last_coff, tgtPos, pieceT):
     mat_r = consturctMatR(pieceT=pieceT)
@@ -122,22 +141,24 @@ def finite_horizon_lqr(A, B, Q, R, QN, N):
 class Planner:
     def __init__(self, pieceT) -> None:
         self.pieceT = pieceT / RATIO
-        mat_m_inv = np.linalg.inv(constructMincoM(self.pieceT))
+        mat_m = constructMincoM2(self.pieceT)
+        mat_m_inv = np.linalg.inv(mat_m)
         mat_r = consturctMatR(pieceT=pieceT)
-        mat_s = np.diag([1,1,1,1,1,0])
-        mat_u = np.array([[0,0,0,0,0,1]]).T
+        mat_s = np.diag([1,1,1,1,0,0])
+        mat_u = np.array([[0,0,0,0,1,0]]).T
+
         # mat_h = constructBetaT(pieceT, 0).T
 
         self.mat_F = mat_m_inv @ mat_s @ mat_r              # matF是行向量
         self.mat_G = (mat_m_inv @ mat_u).reshape(-1,1)      # matG是列向量
 
         # LQR
-        # Q = constructBBTint(pieceT=pieceT, rank=3)# + np.diag([1,1,1,0,0,0])*1
-        Q = np.diag([1,0,0,0,0,0])*1
+        Q = constructBBTint(pieceT=pieceT, rank=3)# + np.diag([1,1,1,0,0,0])*3
+        # Q = np.diag([1,0,0,0,0,0])*1
         # Q[0,0] = 1e2
-        R = np.array([[10]])     # 控制权重矩阵
+        R = np.array([[1]])     # 控制权重矩阵
         self.K, _, _ = control.dlqr(self.mat_F, self.mat_G, Q, R)
-        # Kseq,Pseq = finite_horizon_lqr(self.mat_F, self.mat_G, Q, R, np.diag([1,1,1,0,0,0]), 30)
+        # Kseq,Pseq = finite_horizon_lqr(self.mat_F, self.mat_G, Q, R, np.diag([1,1,1,1,1,1])*10, 30)
         # self.K = Kseq[0]
         self.Kpp = sl.pinv(self.mat_G) @ (np.identity(6)-self.mat_F)+self.K
 
@@ -191,9 +212,9 @@ def main():
     planner = Planner(pieceT=pieceT)
 
     square_tgts = np.array([
-       [0,1],
-       [1,1],
-       [1,0],
+       [0,10],
+       [10,10],
+       [10,0],
        [0,0],
     ])
 
@@ -201,9 +222,9 @@ def main():
     coff = constructInitialCoff(init_pos)
 
     for i in range(ITER_TIMES):
-        tgt_pos = square_tgts[(i//80)%4,:]
+        tgt_pos = square_tgts[(i//40)%4,:]
         # tgt_pos = np.random.rand(2)
-        tgt_pos = np.array([20,20])
+        # tgt_pos = np.array([20,20])
 
         # [upper[x, y], lower[x, y]]
         bound = planner.bound_all(coff=coff, nckpt=100)
@@ -214,7 +235,8 @@ def main():
         #     tgt_pos[0],tgt_pos[1],new_tgt_pos[0],new_tgt_pos[1],))
         # print("\n\n")
 
-        coff = planner.iter_func(new_tgt_pos, coff)
+        # coff = planner.iter_func(new_tgt_pos, coff)
+        coff = planner.iter_func_new(new_tgt_pos, coff)
 
         # print(constructBetaT(pieceT, 0).T @ coff)
         coffs.append(coff)
