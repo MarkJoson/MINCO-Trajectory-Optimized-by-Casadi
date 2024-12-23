@@ -1,6 +1,7 @@
 # pylint: disable=C0103,C0111,C0301
 import math
 import casadi as ca
+import numpy as np
 
 from config import *
 
@@ -12,41 +13,41 @@ __all__ = [
 ]
 
 
-def constructBetaT(t, rank:int, SYMT=SYM_TYPE):
+def constructBetaT(t, rank:int):
     ''' 构造特定时间的β(t) '''
-    beta = SYMT(NCOFF, 1)
+    beta = ca.SX(NCOFF, 1)
     for i in range(rank, NCOFF):
         if not isinstance(t, int|float) or t!=0 or i-rank==0:
             beta[i,0] = math.factorial(i)/math.factorial(i-rank) * t**(i-rank)
     return beta
 
-def constructEi(T, SYMT=SYM_TYPE):
+def constructEi(T):
     ''' 构造M矩阵中的Ei(2s*2s)=[β(T), β(T), ..., β(T)^(2s-2)] '''
-    Ei = SYMT(NCOFF, NCOFF)
-    Ei[0, :] = constructBetaT(T, 0, SYMT)
+    Ei = ca.SX(NCOFF, NCOFF)
+    Ei[0, :] = constructBetaT(T, 0)
     for i in range(1, NCOFF):
-        Ei[i, :] = constructBetaT(T, i-1, SYMT)
+        Ei[i, :] = constructBetaT(T, i-1)
     return Ei
 
-def constructFi(SYMT=SYM_TYPE):
+def constructFi():
     ''' 构造M矩阵中的Fi(2s*2s)=[0, -β(0), ..., β(0)^(2s-2)] '''
-    Fi = SYMT(NCOFF, NCOFF)
+    Fi = ca.SX(NCOFF, NCOFF)
     for i in range(1, NCOFF):
-        Fi[i, :] = -constructBetaT(0, i-1, SYMT)
+        Fi[i, :] = -constructBetaT(0, i-1)
     return Fi
 
-def constructF0(SYMT=SYM_TYPE):
+def constructF0():
     ''' 构造M矩阵中的F0(s*2s)=[β(0), ..., β(0)^(s-1)] '''
-    F0 = SYMT(S, NCOFF)      # 端点约束
+    F0 = ca.SX(S, NCOFF)      # 端点约束
     for i in range(S):
-        F0[i, :] = constructBetaT(0, i, SYMT)
+        F0[i, :] = constructBetaT(0, i)
     return F0
 
-def constructEM(T,SYMT=SYM_TYPE):
+def constructEM(T):
     ''' 构造M矩阵中的E0(s*2s)=[β(T), ..., β(T)^(s-1)] '''
-    E0 = SYMT(S, NCOFF)      # 端点约束
+    E0 = ca.SX(S, NCOFF)      # 端点约束
     for i in range(S):
-        E0[i, :] = constructBetaT(T, i, SYMT)
+        E0[i, :] = constructBetaT(T, i)
     return E0
 
 def constructM(pieceT, num_pieces, SYMT=SYM_TYPE):
@@ -57,21 +58,21 @@ def constructM(pieceT, num_pieces, SYMT=SYM_TYPE):
         ...
     ]
     '''
-    M = SYMT(num_pieces*NCOFF, num_pieces*NCOFF)
+    M = ca.SX(num_pieces*NCOFF, num_pieces*NCOFF)
     # F0 = SYM_TYPE.sym('F0', 3, 6)
     # EM = SYM_TYPE.sym('EM', 3, 6)
-    M[0:S, 0:NCOFF] = constructF0(SYMT)         # 3*6
-    M[-S:, -NCOFF:] = constructEM(T=pieceT, SYMT=SYMT) # 3*6
+    M[0:S, 0:NCOFF] = constructF0()         # 3*6
+    M[-S:, -NCOFF:] = constructEM(T=pieceT) # 3*6
     for i in range(1, num_pieces):
         # Fi = SYM_TYPE.sym(f'F{i}', 6, 6)
         # Ei = SYM_TYPE.sym(f'E{i}', 6, 6)
-        M[(i-1)*NCOFF+S:i*NCOFF+S, (i-1)*NCOFF:i*NCOFF] = constructEi(pieceT, SYMT)
-        M[(i-1)*NCOFF+S:i*NCOFF+S, i*NCOFF:(i+1)*NCOFF] = constructFi(SYMT)
+        M[(i-1)*NCOFF+S:i*NCOFF+S, (i-1)*NCOFF:i*NCOFF] = constructEi(pieceT)
+        M[(i-1)*NCOFF+S:i*NCOFF+S, i*NCOFF:(i+1)*NCOFF] = constructFi()
     return M
 
 def constructB(state0, stateT, mid_pos, num_pieces):
     ''' 构造右端路径点约束B矩阵'''
-    B = SYM_TYPE(num_pieces*NCOFF, NDIM)
+    B = ca.SX(num_pieces*NCOFF, NDIM)
     B[0:S,:] = state0                     # 起点状态
     B[-S:,:] = stateT                       # 终点状态
     for i in range(1, num_pieces):
@@ -80,7 +81,7 @@ def constructB(state0, stateT, mid_pos, num_pieces):
 
 def constructBBTint(pieceT, rank):
     ''' c^T*(∫β*β^T*dt)*c ==> (2, NCOFF) * (NCOFF, NCOFF) * (NCOFF, 2) '''
-    bbint = SYM_TYPE(NCOFF, NCOFF)
+    bbint = ca.SX(NCOFF, NCOFF)
     beta = constructBetaT(pieceT, rank)
     for i in range(NCOFF):
         for j in range(NCOFF):
@@ -115,8 +116,8 @@ def softmax_func(x):
 
 def constructCkptMat(pieceT, num_ckpt:int, rank:int):
     ''' 构造单个piece的CKPT检查矩阵 '''
-    ckpt_mat = SYM_TYPE(NCOFF, num_ckpt)
-    ckpt_frac = [(i+1)/(num_ckpt+1) for i in range(num_ckpt)]
+    ckpt_mat = ca.SX(NCOFF, num_ckpt)
+    ckpt_frac = np.array([(i+1)/(num_ckpt+1) for i in range(num_ckpt)])
     ckpt_ts = ckpt_frac * pieceT
 
     for i in range(num_ckpt):
@@ -125,7 +126,7 @@ def constructCkptMat(pieceT, num_ckpt:int, rank:int):
 
 def constructNPiecesCkptMat(pieceT, rank:int, nckpt:int, npiece:int):
     ''' 构造整条轨迹的ckpt检查矩阵[NPIECE*NCOFF, NPIECE*NCKPT] '''
-    ckpt_mat = SYM_TYPE(npiece*NCOFF, npiece*nckpt)
+    ckpt_mat = ca.SX(npiece*NCOFF, npiece*nckpt)
     for i in range(npiece):
         ckpt_mat[i*NCOFF:(i+1)*NCOFF, i*nckpt:(i+1)*nckpt] = constructCkptMat(pieceT=pieceT, num_ckpt=nckpt, rank=rank)
     return ckpt_mat
@@ -133,8 +134,8 @@ def constructNPiecesCkptMat(pieceT, rank:int, nckpt:int, npiece:int):
 
 def create_poly_eval_func(n_piece, n_drawpt):
     '''多项式评估函数，输入多项式系数，输出采样点'''
-    T = SYM_TYPE.sym('T') # type: ignore
-    coff = SYM_TYPE.sym('coff', NCOFF*n_piece, NDIM) # type: ignore
+    T = ca.SX.sym('T') # type: ignore
+    coff = ca.SX.sym('coff', NCOFF*n_piece, NDIM) # type: ignore
 
     pos_ckpt_mat = constructNPiecesCkptMat(pieceT=T, rank=0, nckpt=n_drawpt, npiece=n_piece)
     vel_ckpt_mat = constructNPiecesCkptMat(pieceT=T, rank=1, nckpt=n_drawpt, npiece=n_piece)
@@ -152,7 +153,7 @@ def create_poly_eval_func(n_piece, n_drawpt):
 
     numerator = (vel_ckpts[:,0]*acc_ckpts[:,1] - vel_ckpts[:,1]*acc_ckpts[:,0])**2
     denominator = vels_sqsum**3
-    curvature_sq_ckpts = numerator / (denominator+1e-6)
+    curvature_sq_ckpts = numerator / (denominator+1e-10)
 
     return ca.Function(
         'poly_eval',
@@ -165,10 +166,10 @@ def create_poly_eval_func(n_piece, n_drawpt):
 
 def create_traj_eval_func(n_piece, n_drawpt, n_mid_pos):
     ''' 轨迹（多条piece）评估函数，输入起始点和中止点，输出采样点'''
-    T = SYM_TYPE.sym('T') # type: ignore
-    state0 = SYM_TYPE.sym('state0', S, NDIM)                # 起始坐标，行向量 # type: ignore
-    stateT = SYM_TYPE.sym('stateT', S, NDIM)                # 结束坐标，行向量 # type: ignore
-    mid_pos = SYM_TYPE.sym('mid_pos', n_mid_pos, NDIM)      # 中间坐标，行向量 # type: ignore
+    T = ca.SX.sym('T') # type: ignore
+    state0 = ca.SX.sym('state0', S, NDIM)                # 起始坐标，行向量 # type: ignore
+    stateT = ca.SX.sym('stateT', S, NDIM)                # 结束坐标，行向量 # type: ignore
+    mid_pos = ca.SX.sym('mid_pos', n_mid_pos, NDIM)      # 中间坐标，行向量 # type: ignore
 
     poly_eval_fn = create_poly_eval_func(n_piece=n_piece, n_drawpt=n_drawpt)
 

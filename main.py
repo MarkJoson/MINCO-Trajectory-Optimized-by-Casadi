@@ -13,10 +13,10 @@ from toolbox import *
 np.set_printoptions(precision=50)
 
 # 轨迹优化参数
-NTRAJ     = 1         # 轨迹条数
-NPIECE    = 5         # 5阶段轨迹曲线
+NTRAJ     = 3         # 轨迹条数
+NPIECE    = 2         # 5阶段轨迹曲线
 NMIDPT    = NTRAJ*NPIECE-1      # 中间路径点（优化变量）个数
-NCKPT     = 20        # 检查点个数
+NCKPT     = 50        # 检查点个数
 NDRAW_PT  = 50
 
 # 车辆换档时的速度
@@ -28,10 +28,10 @@ max_acc_sq = 3
 max_cur_sq = 1.5
 
 # 优化权重
-weight_dt = 10
-weight_vel = 0*1000.0
-weight_acc = 0*1000.0
-weight_cur = 0*1000.0
+weight_dt = 1
+weight_vel = 1*100.0
+weight_acc = 1*100.0
+weight_cur = 1*300.0
 
 
 def create_state_by_pos_dir_func():
@@ -47,7 +47,7 @@ def create_state_by_pos_dir_func():
     return ca.Function('state_by_pos_dir', [pos, vel_amp, vel_theta, vel_sign], [ret])
 
 
-def objectFuncWithConstrain(mid_pos, vel_angles, traj_ts_free, start_state, end_state):
+def create_obj_with_cons_fn(start_state, end_state):
     ''' 代价函数
     中间点的个数为: NTraj * NPiece - 1
     其中i*NPiece是轨迹i和轨迹i+1的交界
@@ -56,6 +56,10 @@ def objectFuncWithConstrain(mid_pos, vel_angles, traj_ts_free, start_state, end_
     ×  ▲  ▲  ▲  ●  ▲  ▲  ▲  ●  ▲  ▲  ▲  ●  ▲  ▲  ▲  ×
        -  -  -  ↑  -  -  -  ↑  -  -  -  ↑  -  -  -
        0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 '''
+
+    mid_pos = ca.SX.sym('mid_pos', NMIDPT, NDIM) # type: ignore
+    vel_angles = ca.SX.sym('vel_angles', NTRAJ-1, 1) # type: ignore
+    traj_ts_free = ca.SX.sym('traj_ts_free', NTRAJ, 1) # type: ignore
 
     cost =  0
     traj_ts = tau2T_func(traj_ts_free)
@@ -93,29 +97,15 @@ def objectFuncWithConstrain(mid_pos, vel_angles, traj_ts_free, start_state, end_
 
         numerator = (vels[:,0]*accs[:,1] - vels[:,1]*accs[:,0])**2
         denominator = vels_sqsum**3
-        curvature_sq = numerator / (denominator)#+1e-5)
+        curvature_sq = numerator / (denominator+1e-10)
 
         con_vel = ca.sum1(L1_func(vels_sqsum - max_vel_sq))
         con_acc = ca.sum1(L1_func(accs_sqsum - max_acc_sq))
         con_cur = ca.sum1(L1_func(curvature_sq - max_cur_sq))
 
         cost += pieceT * weight_dt + weight_vel*con_vel + weight_acc*con_acc + weight_cur*con_cur
-    return cost
+    return ca.Function('obj_with_cons', [mid_pos, vel_angles, traj_ts_free], [cost])
 
-def test_obj_func():
-    ''' 使用代数变量带入参数方便检查错误 '''
-    mid_pos = SYM_TYPE.sym('mid_pos', NTRAJ*NPIECE-1, NDIM) # type: ignore
-    vel_angles = SYM_TYPE.sym('vel_angles', NTRAJ-1) # type: ignore
-    traj_ts_free = SYM_TYPE.sym('traj_ts_free', NTRAJ) # type: ignore
-    start_state = SYM_TYPE.sym('start_state', S, NDIM) # type: ignore
-    end_state = SYM_TYPE.sym('end_state', S, NDIM) # type: ignore
-
-    objectFuncWithConstrain(
-        mid_pos=mid_pos,
-        vel_angles=vel_angles,
-        traj_ts_free=traj_ts_free,
-        start_state=start_state,
-        end_state=end_state)
 
 ## ^-------------------------------求解----------------------------------####
 
@@ -175,32 +165,31 @@ def solve_softobj_with_solver(start_state_np, end_state_np, solver_name: str) ->
     # 定义变量
     mid_pos = opti.variable(NMIDPT, NDIM)
     vel_angles = opti.variable(NTRAJ-1, 1)
-    traj_ts_free = ca.DM(np.ones((NTRAJ))*8)
-    # traj_ts_free = opti.variable(NTRAJ, 1)
+    # traj_ts_free = ca.DM(np.ones((NTRAJ))*8)
+    traj_ts_free = opti.variable(NTRAJ, 1)
 
     # 设置初值
 
-    # opti.set_initial(mid_pos, np.array([[-0.00264075,  0.11095673],
-    #    [-0.01577599,  0.17299636],
-    #    [ 0.5       ,  0.05792456],
-    #    [ 1.01577598,  0.17299636],
-    #    [ 1.00264075,  0.11095673]]))
-    opti.set_initial(mid_pos, np.array([end_state_np[0,:]*(i+1)/(NMIDPT+1)+start_state_np[0,:]*(1-(i+1)/(NMIDPT+1)) for i in range(NMIDPT)]))
+    opti.set_initial(mid_pos, np.array([[-0.00264075,  0.11095673],
+       [-0.01577599,  0.17299636],
+       [ 0.5       ,  0.05792456],
+       [ 1.01577598,  0.17299636],
+       [ 1.00264075,  0.11095673]]))
+    # opti.set_initial(mid_pos, np.array([end_state_np[0,:]*(i+1)/(NMIDPT+1)+start_state_np[0,:]*(1-(i+1)/(NMIDPT+1)) for i in range(NMIDPT)]))
     opti.set_initial(vel_angles, np.array([ca.pi]))
-    # opti.set_initial(traj_ts_free, np.array([0.1]))
+    opti.set_initial(traj_ts_free, np.array([0.1]))
 
-    # 设置目标函数
-    opti.minimize(objectFuncWithConstrain(
-        mid_pos=mid_pos,
-        vel_angles=vel_angles,
-        traj_ts_free=traj_ts_free,
+    obj_fn = create_obj_with_cons_fn(
         start_state=start_state,
         end_state=end_state
-    ))
+    )
+
+    # 设置目标函数
+    opti.minimize(obj_fn(mid_pos, vel_angles, traj_ts_free))
 
     # 配置求解器选项
     solver_options = get_solver_options(solver_name)
-    opti.solver(solver_name)#, solver_options)
+    opti.solver(solver_name, solver_options)
 
     # 计时并求解
     start_time = time.time()
@@ -335,12 +324,12 @@ def evaluate(mid_pos, vel_angles, traj_ts_free, start_state, end_state):
 def main():
     start_state = np.array([
         [0.0,0.0],
-        [0.0,-0.5],
+        [0.0,-0.25],
         [0.0,0.0]
     ])
     end_state = np.array([
-        [1.0,0.0],
-        [0.0,0.25],
+        [2.0,0.0],
+        [0.0,-0.25],
         [0.0,0.0]
     ])
 

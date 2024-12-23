@@ -187,11 +187,14 @@ class Planner:
 
         return np.array([(-val - const_coeff@coff)/bound_coeff, (val - const_coeff@coff)/bound_coeff])
 
-
     def bound_all(self, coff, nckpt):
         ts = [((i+1)/(nckpt+1)*self.pieceT) for i in range(nckpt)]
         vel_bounds = np.concatenate([self.calc_bound(t, 1, 2, coff) for t in ts], axis=1)
         acc_bounds = np.concatenate([self.calc_bound(t, 2, 3, coff) for t in ts], axis=1)
+
+        # for t in ts:
+        #     if vel_bounds >
+
         # jerk_bounds = np.concatenate([self.calc_bound(t, 3, 300, coff) for t in ts], axis=1)
         bounds = np.concatenate([vel_bounds, acc_bounds], axis=1)
 
@@ -227,7 +230,7 @@ def main():
         # tgt_pos = np.array([20,20])
 
         # [upper[x, y], lower[x, y]]
-        bound = planner.bound_all(coff=coff, nckpt=100)
+        bound = planner.bound_all(coff=coff, nckpt=20)
         new_tgt_pos = np.clip(tgt_pos, bound[0], bound[1])
 
         # print("bound.x=(%.2f, %.2f), y(%.2f,%.2f) ---- old_tgt=(%.2f,%.2f) ---- new_tgt=(%.2f,%.2f)" % (
