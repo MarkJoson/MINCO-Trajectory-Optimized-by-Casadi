@@ -37,10 +37,10 @@ def create_visualization(eval_result, total_time):
     time = np.linspace(0, total_time, n_points)
 
     # Calculate derived quantities
-    speed_magnitude = np.max(np.abs(vel), axis=0)
-    # speed_magnitude = np.sum(vel**2, axis=0)
-    accel_magnitude = np.max(np.abs(acc), axis=0)
-    # accel_magnitude = np.sum(acc**2, axis=0)
+    # speed_magnitude = np.max(np.abs(vel), axis=0)
+    speed_magnitude = np.sum(vel**2, axis=0)
+    # accel_magnitude = np.max(np.abs(acc), axis=0)
+    accel_magnitude = np.sum(acc**2, axis=0)
 
     # Create figure and subplots
     fig = plt.figure(figsize=(12, 8))

@@ -8,6 +8,10 @@ from evaluate import create_visualization
 import scipy.linalg as sl
 import control
 
+import matplotlib
+matplotlib.use('TkAgg')
+
+
 ITER_TIMES = 200
 DRAWPT_PER_PIECE = 2
 
